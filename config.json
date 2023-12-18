@@ -1,0 +1,34 @@
+{
+  "db": {
+    "driver": "sqlite",
+    "options": {
+      "path": "data/db.sqlite"
+    }
+  },
+  "server": {
+    "port": 4242,
+    "site_url": "http://localhost:3000"
+  },
+  "invoker": {
+    "workers": 1,
+    "safeexec": {
+      "path": "cmd/safeexec/safeexec"
+    }
+  },
+  "security": {
+    "password_salt": "qwerty123"
+  },
+  "storage": {
+    "driver": "local",
+    "options": {
+      "files_dir": "data/files"
+    }
+  },
+  "smtp": {
+    "host": "smtp.yandex.ru",
+    "port": 465,
+    "email": "solveby@ya.ru",
+    "password": "mqtivcdvpsaovlyw"
+  },
+  "log_level": "debug"
+}
