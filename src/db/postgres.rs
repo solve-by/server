@@ -157,12 +157,12 @@ impl<'a> AnyTransactionBackend<'a> for PostgresTransaction<'a> {
 pub struct PostgresRows(Pin<Box<deadpool_postgres::tokio_postgres::RowStream>>);
 
 impl Stream for PostgresRows {
-    type Item = ();
+    type Item = Result<(), Error>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<()>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let inner = self.0.as_mut();
         let row = ready!(inner.poll_next(cx));
-        Poll::Ready(if let Some(_) = row { Some(()) } else { None })
+        Poll::Ready(row.map(|_| Ok(())))
     }
 }
 

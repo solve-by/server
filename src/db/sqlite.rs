@@ -13,159 +13,275 @@ use super::{
     Executor, Rows, Transaction, TransactionOptions,
 };
 
-enum SQLiteCommand {
+struct ExecuteCommand {
+    statement: String,
+    tx: oneshot::Sender<Result<(), Error>>,
+}
+
+struct QueryCommand {
+    statement: String,
+    tx: oneshot::Sender<Result<mpsc::Receiver<Result<(), Error>>, Error>>,
+}
+
+enum ConnectionCommand {
     Transaction {
         options: TransactionOptions,
-        tx: oneshot::Sender<Result<(), Error>>,
+        tx: oneshot::Sender<Result<TransactionHandle, Error>>,
     },
-    Execute {
-        statement: String,
-        tx: oneshot::Sender<Result<(), Error>>,
-    },
-    Query {
-        statement: String,
-        tx: oneshot::Sender<Result<mpsc::Receiver<()>, Error>>,
-    },
+    Execute(ExecuteCommand),
+    Query(QueryCommand),
+    Shutdown,
+}
+
+struct ConnectionHandle(mpsc::Sender<ConnectionCommand>);
+
+impl ConnectionHandle {
+    async fn transaction(
+        &mut self,
+        options: TransactionOptions,
+    ) -> Result<TransactionHandle, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.0
+            .send(ConnectionCommand::Transaction { options, tx })
+            .await?;
+        rx.await?
+    }
+
+    async fn execute(&mut self, statement: &str) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.0
+            .send(ConnectionCommand::Execute(ExecuteCommand {
+                statement: statement.to_owned(),
+                tx,
+            }))
+            .await?;
+        rx.await?
+    }
+
+    async fn query<'r>(&'r mut self, statement: &str) -> Result<SQLiteRows, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.0
+            .send(ConnectionCommand::Query(QueryCommand {
+                statement: statement.to_owned(),
+                tx,
+            }))
+            .await?;
+        Ok(SQLiteRows { rx: rx.await?? })
+    }
+}
+
+struct ConnectionTask {
+    conn: deadpool_sqlite::Connection,
+    tx: mpsc::Sender<ConnectionCommand>,
+    rx: mpsc::Receiver<ConnectionCommand>,
+}
+
+impl ConnectionTask {
+    pub fn new(conn: deadpool_sqlite::Connection) -> Self {
+        let (tx, rx) = mpsc::channel(1);
+        Self { conn, tx, rx }
+    }
+
+    fn run(mut self, rx: oneshot::Sender<Result<ConnectionHandle, Error>>) -> Result<(), Error> {
+        let mut conn = match self.conn.lock() {
+            Ok(conn) => conn,
+            Err(err) => {
+                let _ = rx.send(Err(err.to_string().into()));
+                return Ok(());
+            }
+        };
+        if let Err(_) = rx.send(Ok(ConnectionHandle(self.tx))) {
+            // Drop connection if nobody listens result.
+            return Ok(());
+        }
+        while let Some(cmd) = self.rx.blocking_recv() {
+            match cmd {
+                ConnectionCommand::Transaction { tx, .. } => {
+                    let task = TransactionTask::new(&mut conn);
+                    task.run(tx)?;
+                    continue;
+                }
+                ConnectionCommand::Execute(cmd) => {
+                    let _ = cmd.tx.send(
+                        conn.execute(&cmd.statement, [])
+                            .map_err(|e| e.into())
+                            .map(|_| ()),
+                    );
+                }
+                ConnectionCommand::Query(cmd) => {
+                    let mut stmt = match conn.prepare(&cmd.statement) {
+                        Ok(stmt) => stmt,
+                        Err(err) => {
+                            let _ = cmd.tx.send(Err(err.into()));
+                            continue;
+                        }
+                    };
+                    let mut rows = match stmt.query([]) {
+                        Ok(rows) => rows,
+                        Err(err) => {
+                            let _ = cmd.tx.send(Err(err.into()));
+                            continue;
+                        }
+                    };
+                    let (tx, rx) = mpsc::channel(1);
+                    if let Err(_) = cmd.tx.send(Ok(rx)) {
+                        // Drop query if nobody listens result.
+                        continue;
+                    }
+                    loop {
+                        let row = match rows.next() {
+                            Ok(Some(row)) => row,
+                            Ok(None) => break,
+                            Err(err) => {
+                                _ = tx.blocking_send(Err(err.into()));
+                                break;
+                            }
+                        };
+                        if let Err(_) = tx.blocking_send(Ok(())) {
+                            break;
+                        }
+                    }
+                }
+                ConnectionCommand::Shutdown => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+}
+
+enum TransactionCommand {
     Commit {
         tx: oneshot::Sender<Result<(), Error>>,
     },
     Rollback {
         tx: oneshot::Sender<Result<(), Error>>,
     },
-    Drop,
+    Execute(ExecuteCommand),
+    Query(QueryCommand),
+    Shutdown,
 }
 
-fn run_query(
-    conn: &SyncGuard<'_, deadpool_sqlite::rusqlite::Connection>,
-    statement: String,
-    tx: oneshot::Sender<Result<mpsc::Receiver<()>, Error>>,
-) {
-    let mut stmt = match conn.prepare(&statement) {
-        Ok(stmt) => stmt,
-        Err(err) => {
-            _ = tx.send(Err(err.into()));
-            return;
-        }
-    };
-    let mut rows = match stmt.query([]) {
-        Ok(rows) => rows,
-        Err(err) => {
-            _ = tx.send(Err(err.into()));
-            return;
-        }
-    };
-    let (row_tx, row_rx) = mpsc::channel(1);
-    tx.send(Ok(row_rx)).unwrap();
-    loop {
-        let row = match rows.next() {
-            Ok(row) => row,
-            Err(err) => return,
+struct TransactionHandle(mpsc::Sender<TransactionCommand>);
+
+struct TransactionTask<'a, 'b> {
+    conn: &'a mut SyncGuard<'b, deadpool_sqlite::rusqlite::Connection>,
+    tx: mpsc::Sender<TransactionCommand>,
+    rx: mpsc::Receiver<TransactionCommand>,
+}
+
+impl<'a, 'b> TransactionTask<'a, 'b> {
+    pub fn new(conn: &'a mut SyncGuard<'b, deadpool_sqlite::rusqlite::Connection>) -> Self {
+        let (tx, rx) = mpsc::channel(1);
+        Self { conn, tx, rx }
+    }
+
+    pub fn run(
+        mut self,
+        rx: oneshot::Sender<Result<TransactionHandle, Error>>,
+    ) -> Result<(), Error> {
+        let transaction = match self.conn.transaction() {
+            Ok(conn) => conn,
+            Err(err) => {
+                let _ = rx.send(Err(err.to_string().into()));
+                return Ok(());
+            }
         };
-        let row = match row {
-            Some(row) => row,
-            None => return,
-        };
-        if let Err(_) = row_tx.blocking_send(()) {
-            return;
+        if let Err(_) = rx.send(Ok(TransactionHandle(self.tx))) {
+            // Drop transaction if nobody listens result.
+            return Ok(());
         }
+        while let Some(cmd) = self.rx.blocking_recv() {
+            match cmd {
+                TransactionCommand::Commit { tx } => {
+                    let _ = tx.send(transaction.commit().map_err(|e| e.into()));
+                    return Ok(());
+                }
+                TransactionCommand::Rollback { tx } => {
+                    let _ = tx.send(transaction.rollback().map_err(|e| e.into()));
+                    return Ok(());
+                }
+                TransactionCommand::Execute(cmd) => {
+                    let _ = cmd.tx.send(
+                        transaction
+                            .execute(&cmd.statement, [])
+                            .map_err(|e| e.into())
+                            .map(|_| ()),
+                    );
+                }
+                TransactionCommand::Query(cmd) => {
+                    let mut stmt = match transaction.prepare(&cmd.statement) {
+                        Ok(stmt) => stmt,
+                        Err(err) => {
+                            let _ = cmd.tx.send(Err(err.into()));
+                            continue;
+                        }
+                    };
+                    let mut rows = match stmt.query([]) {
+                        Ok(rows) => rows,
+                        Err(err) => {
+                            let _ = cmd.tx.send(Err(err.into()));
+                            continue;
+                        }
+                    };
+                    let (tx, rx) = mpsc::channel(1);
+                    if let Err(_) = cmd.tx.send(Ok(rx)) {
+                        // Drop query if nobody listens result.
+                        continue;
+                    }
+                    loop {
+                        let row = match rows.next() {
+                            Ok(Some(row)) => row,
+                            Ok(None) => break,
+                            Err(err) => {
+                                _ = tx.blocking_send(Err(err.into()));
+                                break;
+                            }
+                        };
+                        if let Err(_) = tx.blocking_send(Ok(())) {
+                            break;
+                        }
+                    }
+                }
+                TransactionCommand::Shutdown => return Ok(()),
+            }
+        }
+        Ok(())
     }
 }
 
-fn run_tx_query(
-    transaction: &mut deadpool_sqlite::rusqlite::Transaction<'_>,
-    statement: String,
-    tx: oneshot::Sender<Result<mpsc::Receiver<()>, Error>>,
-) {
-    let mut stmt = match transaction.prepare(&statement) {
-        Ok(stmt) => stmt,
-        Err(err) => {
-            _ = tx.send(Err(err.into()));
-            return;
-        }
-    };
-    let mut rows = match stmt.query([]) {
-        Ok(rows) => rows,
-        Err(err) => {
-            _ = tx.send(Err(err.into()));
-            return;
-        }
-    };
-    let (row_tx, row_rx) = mpsc::channel(1);
-    tx.send(Ok(row_rx)).unwrap();
-    loop {
-        let row = match rows.next() {
-            Ok(row) => row,
-            Err(err) => return,
-        };
-        let row = match row {
-            Some(row) => row,
-            None => return,
-        };
-        if let Err(_) = row_tx.blocking_send(()) {
-            return;
-        }
+impl TransactionHandle {
+    async fn commit(self) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.0.send(TransactionCommand::Commit { tx }).await?;
+        rx.await?
     }
-}
 
-fn run_transaction(
-    rx: &mut mpsc::Receiver<SQLiteCommand>,
-    conn: &mut SyncGuard<'_, deadpool_sqlite::rusqlite::Connection>,
-    _options: TransactionOptions,
-    tx: oneshot::Sender<Result<(), Error>>,
-) {
-    let mut transaction = match conn.transaction() {
-        Ok(tx) => tx,
-        Err(err) => {
-            _ = tx.send(Err(err.into()));
-            return;
-        }
-    };
-    tx.send(Ok(())).unwrap();
-    while let Some(cmd) = rx.blocking_recv() {
-        match cmd {
-            SQLiteCommand::Transaction { .. } => unreachable!(),
-            SQLiteCommand::Execute { statement, tx } => {
-                tx.send(match transaction.execute(&statement, []) {
-                    Ok(_) => Ok(()),
-                    Err(err) => Err(err.into()),
-                })
-                .unwrap();
-            }
-            SQLiteCommand::Query { statement, tx } => run_tx_query(&mut transaction, statement, tx),
-            SQLiteCommand::Commit { tx } => {
-                transaction.commit().unwrap();
-                tx.send(Ok(())).unwrap();
-                return;
-            }
-            SQLiteCommand::Rollback { tx } => {
-                transaction.rollback().unwrap();
-                tx.send(Ok(())).unwrap();
-                return;
-            }
-            SQLiteCommand::Drop => return,
-        }
+    async fn rollback(self) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.0.send(TransactionCommand::Rollback { tx }).await?;
+        rx.await?
     }
-}
 
-fn run_connection(mut rx: mpsc::Receiver<SQLiteCommand>, conn: deadpool_sqlite::Connection) {
-    let mut conn = conn.lock().unwrap();
-    while let Some(cmd) = rx.blocking_recv() {
-        match cmd {
-            SQLiteCommand::Transaction { options, tx } => {
-                run_transaction(&mut rx, &mut conn, options, tx)
-            }
-            SQLiteCommand::Execute { statement, tx } => {
-                tx.send(match conn.execute(&statement, []) {
-                    Ok(_) => Ok(()),
-                    Err(err) => Err(err.into()),
-                })
-                .unwrap();
-            }
-            SQLiteCommand::Query { statement, tx } => run_query(&conn, statement, tx),
-            SQLiteCommand::Commit { .. } => unreachable!(),
-            SQLiteCommand::Rollback { .. } => unreachable!(),
-            SQLiteCommand::Drop => return,
-        }
+    async fn execute(&mut self, statement: &str) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.0
+            .send(TransactionCommand::Execute(ExecuteCommand {
+                statement: statement.to_owned(),
+                tx,
+            }))
+            .await?;
+        rx.await?
+    }
+
+    async fn query<'r>(&'r mut self, statement: &str) -> Result<SQLiteRows, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.0
+            .send(TransactionCommand::Query(QueryCommand {
+                statement: statement.to_owned(),
+                tx,
+            }))
+            .await?;
+        Ok(SQLiteRows { rx: rx.await?? })
     }
 }
 
@@ -177,10 +293,11 @@ impl Database for SQLiteDatabase {
 
     async fn connection(&self, _options: ConnectionOptions) -> Result<Self::Connection, Error> {
         let conn = self.0.get().await?;
-        let (tx, rx) = mpsc::channel(1);
-        let handle = tokio::task::spawn_blocking(move || run_connection(rx, conn));
+        let task = ConnectionTask::new(conn);
+        let (tx, rx) = oneshot::channel();
+        let handle = tokio::task::spawn_blocking(move || task.run(tx));
         Ok(SQLiteConnection {
-            tx,
+            tx: Some(rx.await??),
             handle: Some(handle),
         })
     }
@@ -199,19 +316,17 @@ impl AnyDatabaseBackend for SQLiteDatabase {
 }
 
 pub struct SQLiteConnection {
-    tx: tokio::sync::mpsc::Sender<SQLiteCommand>,
-    handle: Option<tokio::task::JoinHandle<()>>,
+    tx: Option<ConnectionHandle>,
+    handle: Option<tokio::task::JoinHandle<Result<(), Error>>>,
 }
 
 impl Drop for SQLiteConnection {
     fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            futures::executor::block_on(tx.0.send(ConnectionCommand::Shutdown)).unwrap();
+        }
         if let Some(handle) = self.handle.take() {
-            let tx = self.tx.clone();
-            futures::executor::block_on(async move {
-                let _ = tx.send(SQLiteCommand::Drop).await;
-                handle.await
-            })
-            .unwrap();
+            futures::executor::block_on(handle).unwrap().unwrap();
         };
     }
 }
@@ -223,25 +338,11 @@ impl Executor<'static> for SQLiteConnection {
         Self: 'b;
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(SQLiteCommand::Execute {
-                statement: statement.to_owned(),
-                tx,
-            })
-            .await?;
-        Ok(rx.await??)
+        self.tx.as_mut().unwrap().execute(statement).await
     }
 
     async fn query<'r>(&'r mut self, statement: &str) -> Result<Self::Rows<'r>, Error> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(SQLiteCommand::Query {
-                statement: statement.to_owned(),
-                tx,
-            })
-            .await?;
-        Ok(SQLiteRows { rx: rx.await?? })
+        self.tx.as_mut().unwrap().query(statement).await
     }
 }
 
@@ -253,12 +354,11 @@ impl Connection for SQLiteConnection {
         &'a mut self,
         options: TransactionOptions,
     ) -> Result<Self::Transaction<'a>, Error> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(SQLiteCommand::Transaction { options, tx })
-            .await?;
-        rx.await??;
-        Ok(SQLiteTransaction { conn: Some(self) })
+        let tx = self.tx.as_mut().unwrap().transaction(options).await?;
+        Ok(SQLiteTransaction {
+            _conn: self,
+            tx: Some(tx),
+        })
     }
 }
 
@@ -274,18 +374,15 @@ impl AnyConnectionBackend for SQLiteConnection {
 }
 
 pub struct SQLiteTransaction<'a> {
-    conn: Option<&'a mut SQLiteConnection>,
+    _conn: &'a mut SQLiteConnection,
+    tx: Option<TransactionHandle>,
 }
 
 impl Drop for SQLiteTransaction<'_> {
     fn drop(&mut self) {
-        if let Some(conn) = self.conn.take() {
-            futures::executor::block_on(async move {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let _ = conn.tx.send(SQLiteCommand::Rollback { tx }).await;
-                let _ = rx.await;
-            });
-        };
+        if let Some(tx) = self.tx.take() {
+            futures::executor::block_on(tx.0.send(TransactionCommand::Shutdown)).unwrap();
+        }
     }
 }
 
@@ -296,56 +393,22 @@ impl Executor<'_> for SQLiteTransaction<'_> {
         Self: 'b;
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.conn
-            .as_ref()
-            .unwrap()
-            .tx
-            .send(SQLiteCommand::Execute {
-                statement: statement.to_owned(),
-                tx,
-            })
-            .await?;
-        Ok(rx.await??)
+        self.tx.as_mut().unwrap().execute(statement).await
     }
 
     async fn query<'r>(&'r mut self, statement: &str) -> Result<Self::Rows<'r>, Error> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.conn
-            .as_ref()
-            .unwrap()
-            .tx
-            .send(SQLiteCommand::Query {
-                statement: statement.to_owned(),
-                tx,
-            })
-            .await?;
-        Ok(SQLiteRows { rx: rx.await?? })
+        self.tx.as_mut().unwrap().query(statement).await
     }
 }
 
 #[async_trait::async_trait]
 impl Transaction<'_> for SQLiteTransaction<'_> {
     async fn commit(mut self) -> Result<(), Error> {
-        let (tx, rx) = oneshot::channel();
-        self.conn
-            .take()
-            .unwrap()
-            .tx
-            .send(SQLiteCommand::Commit { tx })
-            .await?;
-        Ok(rx.await??)
+        self.tx.take().unwrap().commit().await
     }
 
     async fn rollback(mut self) -> Result<(), Error> {
-        let (tx, rx) = oneshot::channel();
-        self.conn
-            .take()
-            .unwrap()
-            .tx
-            .send(SQLiteCommand::Rollback { tx })
-            .await?;
-        Ok(rx.await??)
+        self.tx.take().unwrap().rollback().await
     }
 }
 
@@ -362,37 +425,23 @@ impl<'a> AnyTransactionBackend<'a> for SQLiteTransaction<'a> {
     }
 
     async fn commit(mut self: Box<Self>) -> Result<(), Error> {
-        let (tx, rx) = oneshot::channel();
-        self.conn
-            .take()
-            .unwrap()
-            .tx
-            .send(SQLiteCommand::Commit { tx })
-            .await?;
-        Ok(rx.await??)
+        self.tx.take().unwrap().commit().await
     }
 
     async fn rollback(mut self: Box<Self>) -> Result<(), Error> {
-        let (tx, rx) = oneshot::channel();
-        self.conn
-            .take()
-            .unwrap()
-            .tx
-            .send(SQLiteCommand::Rollback { tx })
-            .await?;
-        Ok(rx.await??)
+        self.tx.take().unwrap().rollback().await
     }
 }
 
 pub struct SQLiteRows {
-    rx: mpsc::Receiver<()>,
+    rx: mpsc::Receiver<Result<(), Error>>,
 }
 
 #[async_trait::async_trait]
 impl Stream for SQLiteRows {
-    type Item = ();
+    type Item = Result<(), Error>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<()>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let row = ready!(self.rx.poll_recv(cx));
         Poll::Ready(row)
     }

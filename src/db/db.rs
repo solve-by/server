@@ -57,4 +57,4 @@ pub trait Executor<'a> {
     async fn query<'b>(&'b mut self, statement: &str) -> Result<Self::Rows<'b>, Error>;
 }
 
-pub trait Rows<'a>: futures_core::Stream<Item = ()> {}
+pub trait Rows<'a>: futures_core::Stream<Item = Result<(), Error>> {}

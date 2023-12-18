@@ -34,7 +34,7 @@ pub trait AnyTransactionBackend<'a>: Send + Sync {
 }
 
 #[async_trait::async_trait]
-pub trait AnyRowsBackend<'a>: futures_core::Stream<Item = ()> + Send + Sync {}
+pub trait AnyRowsBackend<'a>: futures_core::Stream<Item = Result<(), Error>> + Send + Sync {}
 
 pub struct AnyDatabase {
     inner: Box<dyn AnyDatabaseBackend>,
@@ -149,7 +149,7 @@ impl<'a> AnyRows<'a> {
 }
 
 impl Stream for AnyRows<'_> {
-    type Item = ();
+    type Item = Result<(), Error>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,

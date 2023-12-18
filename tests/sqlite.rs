@@ -19,14 +19,16 @@ async fn test_sqlite() {
     let mut tx = conn.transaction(Default::default()).await.unwrap();
     let mut rows = tx.query("SELECT 1 UNION SELECT 2").await.unwrap();
     let mut count = 0;
-    while let Some(_) = rows.next().await {
+    while let Some(row) = rows.next().await {
+        assert!(row.is_ok());
         count += 1;
     }
     assert_eq!(count, 2);
     tx.rollback().await.unwrap();
     let mut rows = conn.query("SELECT 1").await.unwrap();
     let mut count = 0;
-    while let Some(_) = rows.next().await {
+    while let Some(row) = rows.next().await {
+        assert!(row.is_ok());
         count += 1;
     }
     assert_eq!(count, 1);
