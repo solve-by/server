@@ -1,15 +1,14 @@
 use std::pin::Pin;
 use std::str::FromStr;
-use std::task::{ready, Context, Poll};
 
-use futures_core::Stream;
+use futures::StreamExt;
 
 use crate::config::PostgresConfig;
 
 use super::{
-    AnyConnection, AnyConnectionBackend, AnyDatabase, AnyDatabaseBackend, AnyRows, AnyRowsBackend,
+    AnyConnection, AnyConnectionBackend, AnyDatabase, AnyDatabaseBackend, AnyRow, AnyRows,
     AnyTransaction, AnyTransactionBackend, Connection, ConnectionOptions, Database, Error,
-    Executor, Rows, Transaction, TransactionOptions,
+    Executor, IsolationLevel, Rows, Transaction, TransactionOptions,
 };
 
 pub struct PostgresDatabase {
@@ -68,8 +67,7 @@ impl Executor<'_> for PostgresConnection {
     }
 
     async fn query<'r>(&'r mut self, statement: &str) -> Result<Self::Rows<'r>, Error> {
-        let rows: deadpool_postgres::tokio_postgres::RowStream =
-            self.0.query_raw(statement.into(), Vec::<i8>::new()).await?;
+        let rows = self.0.query_raw(statement.into(), Vec::<i8>::new()).await?;
         Ok(PostgresRows(Box::pin(rows)))
     }
 }
@@ -84,7 +82,19 @@ impl Connection for PostgresConnection {
         &'a mut self,
         options: TransactionOptions,
     ) -> Result<Self::Transaction<'a>, Error> {
-        let tx = self.0.transaction().await?;
+        use deadpool_postgres::tokio_postgres;
+        let map_level = |v| match v {
+            IsolationLevel::ReadUncommitted => tokio_postgres::IsolationLevel::ReadUncommitted,
+            IsolationLevel::ReadCommitted => tokio_postgres::IsolationLevel::ReadCommitted,
+            IsolationLevel::RepeatableRead => tokio_postgres::IsolationLevel::RepeatableRead,
+            IsolationLevel::Serializable => tokio_postgres::IsolationLevel::Serializable,
+        };
+        let tx_builder = self
+            .0
+            .build_transaction()
+            .read_only(options.read_only)
+            .isolation_level(map_level(options.isolation_level));
+        let tx = tx_builder.start().await?;
         Ok(PostgresTransaction(tx))
     }
 }
@@ -97,6 +107,16 @@ impl AnyConnectionBackend for PostgresConnection {
     ) -> Result<AnyTransaction<'a>, Error> {
         let tx = Connection::transaction(self, options).await?;
         Ok(AnyTransaction::new(tx))
+    }
+
+    async fn execute(&mut self, statement: &str) -> Result<(), Error> {
+        Executor::execute(self, statement).await?;
+        Ok(())
+    }
+
+    async fn query<'b>(&'b mut self, statement: &str) -> Result<AnyRows<'b>, Error> {
+        let rows = Executor::query(self, statement).await?;
+        Ok(AnyRows::new(rows))
     }
 }
 
@@ -135,6 +155,14 @@ impl Transaction<'_> for PostgresTransaction<'_> {
 
 #[async_trait::async_trait]
 impl<'a> AnyTransactionBackend<'a> for PostgresTransaction<'a> {
+    async fn commit(self: Box<Self>) -> Result<(), Error> {
+        Ok(self.0.commit().await?)
+    }
+
+    async fn rollback(self: Box<Self>) -> Result<(), Error> {
+        Ok(self.0.rollback().await?)
+    }
+
     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
         Executor::execute(self, statement).await?;
         Ok(())
@@ -144,31 +172,22 @@ impl<'a> AnyTransactionBackend<'a> for PostgresTransaction<'a> {
         let rows = Executor::query(self, statement).await?;
         Ok(AnyRows::new(rows))
     }
-
-    async fn commit(self: Box<Self>) -> Result<(), Error> {
-        Ok(self.0.commit().await?)
-    }
-
-    async fn rollback(self: Box<Self>) -> Result<(), Error> {
-        Ok(self.0.rollback().await?)
-    }
 }
 
 pub struct PostgresRows(Pin<Box<deadpool_postgres::tokio_postgres::RowStream>>);
 
-impl Stream for PostgresRows {
-    type Item = Result<(), Error>;
+#[async_trait::async_trait]
+impl Rows<'_> for PostgresRows {
+    type Row = AnyRow;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let inner = self.0.as_mut();
-        let row = ready!(inner.poll_next(cx));
-        Poll::Ready(row.map(|_| Ok(())))
+    fn columns(&self) -> &[String] {
+        &[]
+    }
+
+    async fn next(&mut self) -> Option<Result<Self::Row, Error>> {
+        self.0.next().await.map(|_| Ok(AnyRow::new(Vec::new())))
     }
 }
-
-impl Rows<'_> for PostgresRows {}
-
-impl AnyRowsBackend<'_> for PostgresRows {}
 
 pub async fn new_postgres(config: &PostgresConfig) -> Result<PostgresDatabase, Error> {
     let mut hosts = Vec::new();

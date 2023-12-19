@@ -1,7 +1,6 @@
 use std::path::Path;
 
-use futures::StreamExt;
-use solve::db::{Connection, Database, Executor, Transaction};
+use solve::db::{Connection, Database, Executor, Row, Rows, SQLiteValue, Transaction};
 
 #[tokio::test]
 async fn test_sqlite() {
@@ -20,16 +19,18 @@ async fn test_sqlite() {
     let mut rows = tx.query("SELECT 1 UNION SELECT 2").await.unwrap();
     let mut count = 0;
     while let Some(row) = rows.next().await {
-        assert!(row.is_ok());
+        let value = row.as_ref().unwrap().values();
         count += 1;
+        assert_eq!(value[0], SQLiteValue::Integer(count));
     }
     assert_eq!(count, 2);
     tx.rollback().await.unwrap();
     let mut rows = conn.query("SELECT 1").await.unwrap();
     let mut count = 0;
     while let Some(row) = rows.next().await {
-        assert!(row.is_ok());
+        let value = row.as_ref().unwrap().values();
         count += 1;
+        assert_eq!(value[0], SQLiteValue::Integer(count));
     }
     assert_eq!(count, 1);
 }

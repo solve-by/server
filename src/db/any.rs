@@ -1,9 +1,7 @@
-use futures_core::Stream;
-
 use crate::config::DatabaseConfig;
 
 use super::{
-    new_postgres, new_sqlite, Connection, ConnectionOptions, Database, Error, Executor, Rows,
+    new_postgres, new_sqlite, Connection, ConnectionOptions, Database, Error, Executor, Row, Rows,
     Transaction, TransactionOptions,
 };
 
@@ -20,21 +18,44 @@ pub trait AnyConnectionBackend: Send + Sync {
         &'a mut self,
         options: TransactionOptions,
     ) -> Result<AnyTransaction<'a>, Error>;
+
+    async fn execute(&mut self, statement: &str) -> Result<(), Error>;
+
+    async fn query<'r>(&'r mut self, statement: &str) -> Result<AnyRows<'r>, Error>;
 }
 
 #[async_trait::async_trait]
 pub trait AnyTransactionBackend<'a>: Send + Sync {
-    async fn execute(&mut self, statement: &str) -> Result<(), Error>;
-
-    async fn query<'b>(&'b mut self, statement: &str) -> Result<AnyRows<'b>, Error>;
-
     async fn commit(self: Box<Self>) -> Result<(), Error>;
 
     async fn rollback(self: Box<Self>) -> Result<(), Error>;
+
+    async fn execute(&mut self, statement: &str) -> Result<(), Error>;
+
+    async fn query<'r>(&'r mut self, statement: &str) -> Result<AnyRows<'r>, Error>;
 }
 
 #[async_trait::async_trait]
-pub trait AnyRowsBackend<'a>: futures_core::Stream<Item = Result<(), Error>> + Send + Sync {}
+pub trait AnyRowsBackend<'a>: Send + Sync {
+    fn columns(&self) -> &[String];
+
+    async fn next(&mut self) -> Option<Result<AnyRow, Error>>;
+}
+
+#[async_trait::async_trait]
+impl<'a, T, R> AnyRowsBackend<'a> for T
+where
+    T: Rows<'a, Row = R> + Send + Sync,
+    R: Into<AnyRow>,
+{
+    fn columns(&self) -> &[String] {
+        Rows::columns(self)
+    }
+
+    async fn next(&mut self) -> Option<Result<AnyRow, Error>> {
+        Rows::next(self).await.map(|r| r.map(|v| v.into()))
+    }
+}
 
 pub struct AnyDatabase {
     inner: Box<dyn AnyDatabaseBackend>,
@@ -80,11 +101,11 @@ impl Executor<'_> for AnyConnection {
         Self: 'b;
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
-        todo!()
+        self.inner.execute(statement).await
     }
 
     async fn query<'r>(&'r mut self, statement: &str) -> Result<Self::Rows<'r>, Error> {
-        todo!()
+        self.inner.query(statement).await
     }
 }
 
@@ -142,25 +163,51 @@ pub struct AnyRows<'a> {
 }
 
 impl<'a> AnyRows<'a> {
-    pub fn new<T: AnyRowsBackend<'a> + 'a>(conn: T) -> Self {
-        let inner = Box::new(conn);
+    pub fn new<T: AnyRowsBackend<'a> + 'a>(rows: T) -> Self {
+        let inner = Box::new(rows);
         Self { inner }
     }
 }
 
-impl Stream for AnyRows<'_> {
-    type Item = Result<(), Error>;
+#[async_trait::async_trait]
+impl Rows<'_> for AnyRows<'_> {
+    type Row = AnyRow;
 
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let inner = unsafe { std::pin::Pin::new_unchecked(self.inner.as_mut()) };
-        inner.poll_next(cx)
+    fn columns(&self) -> &[String] {
+        self.inner.columns()
+    }
+
+    async fn next(&mut self) -> Option<Result<Self::Row, Error>> {
+        self.inner.next().await
     }
 }
 
-impl Rows<'_> for AnyRows<'_> {}
+pub enum Value {
+    Null,
+    Bool,
+    I64(i64),
+    F64(f64),
+    String(String),
+    Bytes(Vec<u8>),
+}
+
+pub struct AnyRow {
+    values: Vec<Value>,
+}
+
+impl AnyRow {
+    pub fn new(values: Vec<Value>) -> Self {
+        Self { values }
+    }
+}
+
+impl Row for AnyRow {
+    type Value = Value;
+
+    fn values(&self) -> &[Value] {
+        &self.values
+    }
+}
 
 pub async fn new_database(config: &DatabaseConfig) -> Result<AnyDatabase, Error> {
     let db = match config {

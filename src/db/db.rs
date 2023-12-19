@@ -1,18 +1,18 @@
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct ConnectionOptions {
     pub read_only: bool,
 }
 
 #[async_trait::async_trait]
-pub trait Database: Send + Sync {
+pub trait Database {
     type Connection: Connection;
 
     async fn connection(&self, options: ConnectionOptions) -> Result<Self::Connection, Error>;
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub enum IsolationLevel {
     ReadUncommitted,
     #[default]
@@ -21,14 +21,14 @@ pub enum IsolationLevel {
     Serializable,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct TransactionOptions {
-    pub isolation: IsolationLevel,
+    pub isolation_level: IsolationLevel,
     pub read_only: bool,
 }
 
 #[async_trait::async_trait]
-pub trait Connection: Executor<'static> + Send + Sync {
+pub trait Connection: Executor<'static> {
     type Transaction<'a>: Transaction<'a>
     where
         Self: 'a;
@@ -54,7 +54,20 @@ pub trait Executor<'a> {
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error>;
 
-    async fn query<'b>(&'b mut self, statement: &str) -> Result<Self::Rows<'b>, Error>;
+    async fn query<'r>(&'r mut self, statement: &str) -> Result<Self::Rows<'r>, Error>;
 }
 
-pub trait Rows<'a>: futures_core::Stream<Item = Result<(), Error>> {}
+#[async_trait::async_trait]
+pub trait Rows<'a> {
+    type Row: Row;
+
+    fn columns(&self) -> &[String];
+
+    async fn next(&mut self) -> Option<Result<Self::Row, Error>>;
+}
+
+pub trait Row {
+    type Value;
+
+    fn values(&self) -> &[Self::Value];
+}

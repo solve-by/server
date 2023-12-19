@@ -1,16 +1,12 @@
-use std::pin::Pin;
-use std::task::{ready, Context, Poll};
-
 use deadpool_sqlite::SyncGuard;
-use futures_core::Stream;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::SQLiteConfig;
 
 use super::{
-    AnyConnection, AnyConnectionBackend, AnyDatabase, AnyDatabaseBackend, AnyRows, AnyRowsBackend,
+    AnyConnection, AnyConnectionBackend, AnyDatabase, AnyDatabaseBackend, AnyRow, AnyRows,
     AnyTransaction, AnyTransactionBackend, Connection, ConnectionOptions, Database, Error,
-    Executor, Rows, Transaction, TransactionOptions,
+    Executor, Row, Rows, Transaction, TransactionOptions, Value,
 };
 
 struct ExecuteCommand {
@@ -20,7 +16,7 @@ struct ExecuteCommand {
 
 struct QueryCommand {
     statement: String,
-    tx: oneshot::Sender<Result<mpsc::Receiver<Result<(), Error>>, Error>>,
+    tx: oneshot::Sender<Result<SQLiteRows, Error>>,
 }
 
 enum ConnectionCommand {
@@ -66,7 +62,7 @@ impl ConnectionHandle {
                 tx,
             }))
             .await?;
-        Ok(SQLiteRows { rx: rx.await?? })
+        Ok(rx.await??)
     }
 }
 
@@ -102,7 +98,7 @@ impl ConnectionTask {
         }
         while let Some(cmd) = self.rx.blocking_recv() {
             match cmd {
-                ConnectionCommand::Transaction { tx, .. } => {
+                ConnectionCommand::Transaction { tx, options } => {
                     let task = TransactionTask::new(&mut conn);
                     task.run(tx)?;
                     continue;
@@ -122,6 +118,12 @@ impl ConnectionTask {
                             continue;
                         }
                     };
+                    let names: Vec<_> = stmt
+                        .column_names()
+                        .iter_mut()
+                        .map(|v| v.to_owned())
+                        .collect();
+                    let names_len = names.len();
                     let mut rows = match stmt.query([]) {
                         Ok(rows) => rows,
                         Err(err) => {
@@ -130,7 +132,7 @@ impl ConnectionTask {
                         }
                     };
                     let (tx, rx) = mpsc::channel(1);
-                    if let Err(_) = cmd.tx.send(Ok(rx)) {
+                    if let Err(_) = cmd.tx.send(Ok(SQLiteRows { rx, names })) {
                         // Drop query if nobody listens result.
                         continue;
                     }
@@ -143,7 +145,18 @@ impl ConnectionTask {
                                 break;
                             }
                         };
-                        if let Err(_) = tx.blocking_send(Ok(())) {
+                        let mut values = Vec::with_capacity(names_len);
+                        for i in 0..names_len {
+                            let value: deadpool_sqlite::rusqlite::types::Value = match row.get(i) {
+                                Ok(value) => value,
+                                Err(err) => {
+                                    _ = tx.blocking_send(Err(err.into()));
+                                    break;
+                                }
+                            };
+                            values.push(value);
+                        }
+                        if let Err(_) = tx.blocking_send(Ok(SQLiteRow { values })) {
                             break;
                         }
                     }
@@ -201,7 +214,7 @@ impl TransactionHandle {
                 tx,
             }))
             .await?;
-        Ok(SQLiteRows { rx: rx.await?? })
+        Ok(rx.await??)
     }
 }
 
@@ -264,6 +277,12 @@ impl<'a, 'b> TransactionTask<'a, 'b> {
                             continue;
                         }
                     };
+                    let names: Vec<_> = stmt
+                        .column_names()
+                        .iter_mut()
+                        .map(|v| v.to_owned())
+                        .collect();
+                    let names_len = names.len();
                     let mut rows = match stmt.query([]) {
                         Ok(rows) => rows,
                         Err(err) => {
@@ -272,7 +291,7 @@ impl<'a, 'b> TransactionTask<'a, 'b> {
                         }
                     };
                     let (tx, rx) = mpsc::channel(1);
-                    if let Err(_) = cmd.tx.send(Ok(rx)) {
+                    if let Err(_) = cmd.tx.send(Ok(SQLiteRows { rx, names })) {
                         // Drop query if nobody listens result.
                         continue;
                     }
@@ -285,7 +304,18 @@ impl<'a, 'b> TransactionTask<'a, 'b> {
                                 break;
                             }
                         };
-                        if let Err(_) = tx.blocking_send(Ok(())) {
+                        let mut values = Vec::with_capacity(names_len);
+                        for i in 0..names_len {
+                            let value: deadpool_sqlite::rusqlite::types::Value = match row.get(i) {
+                                Ok(value) => value,
+                                Err(err) => {
+                                    _ = tx.blocking_send(Err(err.into()));
+                                    break;
+                                }
+                            };
+                            values.push(value);
+                        }
+                        if let Err(_) = tx.blocking_send(Ok(SQLiteRow { values })) {
                             break;
                         }
                     }
@@ -378,6 +408,16 @@ impl AnyConnectionBackend for SQLiteConnection {
         let tx = Connection::transaction(self, options).await?;
         Ok(AnyTransaction::new(tx))
     }
+
+    async fn execute(&mut self, statement: &str) -> Result<(), Error> {
+        Executor::execute(self, statement).await?;
+        Ok(())
+    }
+
+    async fn query<'b>(&'b mut self, statement: &str) -> Result<AnyRows<'b>, Error> {
+        let rows = Executor::query(self, statement).await?;
+        Ok(AnyRows::new(rows))
+    }
 }
 
 pub struct SQLiteTransaction<'a> {
@@ -413,6 +453,14 @@ impl Transaction<'_> for SQLiteTransaction<'_> {
 
 #[async_trait::async_trait]
 impl<'a> AnyTransactionBackend<'a> for SQLiteTransaction<'a> {
+    async fn commit(mut self: Box<Self>) -> Result<(), Error> {
+        self.tx.commit().await
+    }
+
+    async fn rollback(mut self: Box<Self>) -> Result<(), Error> {
+        self.tx.rollback().await
+    }
+
     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
         Executor::execute(self, statement).await?;
         Ok(())
@@ -422,35 +470,52 @@ impl<'a> AnyTransactionBackend<'a> for SQLiteTransaction<'a> {
         let rows = Executor::query(self, statement).await?;
         Ok(AnyRows::new(rows))
     }
-
-    async fn commit(mut self: Box<Self>) -> Result<(), Error> {
-        self.tx.commit().await
-    }
-
-    async fn rollback(mut self: Box<Self>) -> Result<(), Error> {
-        self.tx.rollback().await
-    }
 }
 
 pub struct SQLiteRows {
-    rx: mpsc::Receiver<Result<(), Error>>,
+    rx: mpsc::Receiver<Result<SQLiteRow, Error>>,
+    names: Vec<String>,
 }
 
 #[async_trait::async_trait]
-impl Stream for SQLiteRows {
-    type Item = Result<(), Error>;
+impl Rows<'_> for SQLiteRows {
+    type Row = SQLiteRow;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let row = ready!(self.rx.poll_recv(cx));
-        Poll::Ready(row)
+    fn columns(&self) -> &[String] {
+        &self.names
+    }
+
+    async fn next(&mut self) -> Option<Result<Self::Row, Error>> {
+        self.rx.recv().await
     }
 }
 
-#[async_trait::async_trait]
-impl Rows<'_> for SQLiteRows {}
+pub type SQLiteValue = deadpool_sqlite::rusqlite::types::Value;
 
-#[async_trait::async_trait]
-impl AnyRowsBackend<'_> for SQLiteRows {}
+pub struct SQLiteRow {
+    values: Vec<SQLiteValue>,
+}
+
+impl Row for SQLiteRow {
+    type Value = SQLiteValue;
+
+    fn values(&self) -> &[SQLiteValue] {
+        &self.values
+    }
+}
+
+impl Into<AnyRow> for SQLiteRow {
+    fn into(self) -> AnyRow {
+        let map_value = |v| match v {
+            SQLiteValue::Null => Value::Null,
+            SQLiteValue::Integer(v) => Value::I64(v),
+            SQLiteValue::Real(v) => Value::F64(v),
+            SQLiteValue::Text(v) => Value::String(v),
+            SQLiteValue::Blob(v) => Value::Bytes(v),
+        };
+        AnyRow::new(self.values.into_iter().map(map_value).collect())
+    }
+}
 
 pub async fn new_sqlite(config: &SQLiteConfig) -> Result<SQLiteDatabase, Error> {
     let config = deadpool_sqlite::Config::new(config.path.to_owned());
