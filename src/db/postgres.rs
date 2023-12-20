@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::str::FromStr;
 
@@ -54,8 +55,8 @@ impl AnyDatabaseBackend for PostgresDatabase {
 pub struct PostgresConnection(deadpool_postgres::Client);
 
 #[async_trait::async_trait]
-impl Executor<'_> for PostgresConnection {
-    type Rows<'b> = PostgresRows
+impl<'a> Executor<'a> for PostgresConnection {
+    type Rows<'b> = PostgresRows<'b>
     where
         Self: 'b;
 
@@ -66,9 +67,12 @@ impl Executor<'_> for PostgresConnection {
         Ok(())
     }
 
-    async fn query<'r>(&'r mut self, statement: &str) -> Result<Self::Rows<'r>, Error> {
+    async fn query<'b>(&'b mut self, statement: &str) -> Result<Self::Rows<'b>, Error> {
         let rows = self.0.query_raw(statement.into(), Vec::<i8>::new()).await?;
-        Ok(PostgresRows(Box::pin(rows)))
+        Ok(PostgresRows {
+            rows: Box::pin(rows),
+            _phantom: PhantomData,
+        })
     }
 }
 
@@ -94,19 +98,20 @@ impl Connection for PostgresConnection {
             .build_transaction()
             .read_only(options.read_only)
             .isolation_level(map_level(options.isolation_level));
-        let tx = tx_builder.start().await?;
-        Ok(PostgresTransaction(tx))
+        let tx = Some(tx_builder.start().await?);
+        Ok(PostgresTransaction { tx })
     }
 }
 
 #[async_trait::async_trait]
 impl AnyConnectionBackend for PostgresConnection {
-    async fn transaction<'a>(
-        &'a mut self,
+    async fn transaction<'b>(
+        &'b mut self,
         options: TransactionOptions,
-    ) -> Result<AnyTransaction<'a>, Error> {
-        let tx = Connection::transaction(self, options).await?;
-        Ok(AnyTransaction::new(tx))
+    ) -> Result<AnyTransaction<'b>, Error> {
+        let tx = Connection::transaction::<'b, 'async_trait>(self, options).await?;
+        todo!()
+        // Ok(AnyTransaction::<'b>::new(tx))
     }
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
@@ -114,58 +119,72 @@ impl AnyConnectionBackend for PostgresConnection {
         Ok(())
     }
 
-    async fn query<'b>(&'b mut self, statement: &str) -> Result<AnyRows<'b>, Error> {
+    async fn query<'a>(&'a mut self, statement: &str) -> Result<AnyRows<'a>, Error> {
         let rows = Executor::query(self, statement).await?;
         Ok(AnyRows::new(rows))
     }
 }
 
-pub struct PostgresTransaction<'a>(deadpool_postgres::Transaction<'a>);
+pub struct PostgresTransaction<'a> {
+    tx: Option<deadpool_postgres::Transaction<'a>>,
+}
+
+impl<'a> Drop for PostgresTransaction<'a> {
+    fn drop(&mut self) {}
+}
 
 #[async_trait::async_trait]
-impl Executor<'_> for PostgresTransaction<'_> {
-    type Rows<'b> = PostgresRows
+impl<'a> Executor<'a> for PostgresTransaction<'a> {
+    type Rows<'b> = PostgresRows<'b>
     where
         Self: 'b;
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
-        self.0
+        self.tx
+            .as_mut()
+            .unwrap()
             .execute_raw(statement.into(), Vec::<i8>::new())
             .await?;
         Ok(())
     }
 
-    async fn query<'r>(&'r mut self, statement: &str) -> Result<Self::Rows<'r>, Error> {
-        let rows: deadpool_postgres::tokio_postgres::RowStream =
-            self.0.query_raw(statement.into(), Vec::<i8>::new()).await?;
-        Ok(PostgresRows(Box::pin(rows)))
+    async fn query<'b>(&'b mut self, statement: &str) -> Result<Self::Rows<'b>, Error> {
+        let rows = self
+            .tx
+            .as_mut()
+            .unwrap()
+            .query_raw(statement.into(), Vec::<i8>::new())
+            .await?;
+        Ok(PostgresRows {
+            rows: Box::pin(rows),
+            _phantom: PhantomData,
+        })
     }
 }
 
 #[async_trait::async_trait]
-impl Transaction<'_> for PostgresTransaction<'_> {
-    async fn commit(self) -> Result<(), Error> {
-        Ok(self.0.commit().await?)
+impl<'a> Transaction<'a> for PostgresTransaction<'a> {
+    async fn commit(mut self) -> Result<(), Error> {
+        Ok(self.tx.take().unwrap().commit().await?)
     }
 
-    async fn rollback(self) -> Result<(), Error> {
-        Ok(self.0.rollback().await?)
+    async fn rollback(mut self) -> Result<(), Error> {
+        Ok(self.tx.take().unwrap().rollback().await?)
     }
 }
 
 #[async_trait::async_trait]
 impl<'a> AnyTransactionBackend<'a> for PostgresTransaction<'a> {
     async fn commit(self: Box<Self>) -> Result<(), Error> {
-        Ok(self.0.commit().await?)
+        Transaction::commit(*self).await
     }
 
     async fn rollback(self: Box<Self>) -> Result<(), Error> {
-        Ok(self.0.rollback().await?)
+        Transaction::rollback(*self).await
     }
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
-        Executor::execute(self, statement).await?;
-        Ok(())
+        Executor::execute(self, statement).await
     }
 
     async fn query<'b>(&'b mut self, statement: &str) -> Result<AnyRows<'b>, Error> {
@@ -174,10 +193,17 @@ impl<'a> AnyTransactionBackend<'a> for PostgresTransaction<'a> {
     }
 }
 
-pub struct PostgresRows(Pin<Box<deadpool_postgres::tokio_postgres::RowStream>>);
+pub struct PostgresRows<'a> {
+    rows: Pin<Box<deadpool_postgres::tokio_postgres::RowStream>>,
+    _phantom: PhantomData<&'a ()>,
+}
+
+impl<'a> Drop for PostgresRows<'a> {
+    fn drop(&mut self) {}
+}
 
 #[async_trait::async_trait]
-impl Rows<'_> for PostgresRows {
+impl<'a> Rows<'a> for PostgresRows<'a> {
     type Row = AnyRow;
 
     fn columns(&self) -> &[String] {
@@ -185,7 +211,7 @@ impl Rows<'_> for PostgresRows {
     }
 
     async fn next(&mut self) -> Option<Result<Self::Row, Error>> {
-        self.0.next().await.map(|_| Ok(AnyRow::new(Vec::new())))
+        self.rows.next().await.map(|_| Ok(AnyRow::new(Vec::new())))
     }
 }
 

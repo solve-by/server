@@ -1,3 +1,5 @@
+use std::marker::PhantomData;
+
 use deadpool_sqlite::SyncGuard;
 use tokio::sync::{mpsc, oneshot};
 
@@ -16,7 +18,7 @@ struct ExecuteCommand {
 
 struct QueryCommand {
     statement: String,
-    tx: oneshot::Sender<Result<SQLiteRows, Error>>,
+    tx: oneshot::Sender<Result<SQLiteRows<'static>, Error>>,
 }
 
 enum ConnectionCommand {
@@ -54,7 +56,7 @@ impl ConnectionHandle {
         rx.await?
     }
 
-    async fn query<'r>(&'r mut self, statement: &str) -> Result<SQLiteRows, Error> {
+    async fn query<'b>(&'b mut self, statement: &str) -> Result<SQLiteRows, Error> {
         let (tx, rx) = oneshot::channel();
         self.0
             .send(ConnectionCommand::Query(QueryCommand {
@@ -132,7 +134,11 @@ impl ConnectionTask {
                         }
                     };
                     let (tx, rx) = mpsc::channel(1);
-                    if let Err(_) = cmd.tx.send(Ok(SQLiteRows { rx, names })) {
+                    if let Err(_) = cmd.tx.send(Ok(SQLiteRows {
+                        rx,
+                        names,
+                        _phantom: PhantomData,
+                    })) {
                         // Drop query if nobody listens result.
                         continue;
                     }
@@ -206,7 +212,7 @@ impl TransactionHandle {
         rx.await?
     }
 
-    async fn query<'r>(&'r mut self, statement: &str) -> Result<SQLiteRows, Error> {
+    async fn query(&mut self, statement: &str) -> Result<SQLiteRows, Error> {
         let (tx, rx) = oneshot::channel();
         self.0
             .send(TransactionCommand::Query(QueryCommand {
@@ -291,7 +297,11 @@ impl<'a, 'b> TransactionTask<'a, 'b> {
                         }
                     };
                     let (tx, rx) = mpsc::channel(1);
-                    if let Err(_) = cmd.tx.send(Ok(SQLiteRows { rx, names })) {
+                    if let Err(_) = cmd.tx.send(Ok(SQLiteRows {
+                        rx,
+                        names,
+                        _phantom: PhantomData,
+                    })) {
                         // Drop query if nobody listens result.
                         continue;
                     }
@@ -372,8 +382,8 @@ impl Drop for SQLiteConnection {
 }
 
 #[async_trait::async_trait]
-impl Executor<'static> for SQLiteConnection {
-    type Rows<'b> = SQLiteRows
+impl<'a> Executor<'a> for SQLiteConnection {
+    type Rows<'b> = SQLiteRows<'b>
     where
         Self: 'b;
 
@@ -381,7 +391,7 @@ impl Executor<'static> for SQLiteConnection {
         self.tx.as_mut().unwrap().execute(statement).await
     }
 
-    async fn query<'r>(&'r mut self, statement: &str) -> Result<Self::Rows<'r>, Error> {
+    async fn query<'b>(&'b mut self, statement: &str) -> Result<Self::Rows<'b>, Error> {
         self.tx.as_mut().unwrap().query(statement).await
     }
 }
@@ -394,19 +404,26 @@ impl Connection for SQLiteConnection {
         &'a mut self,
         options: TransactionOptions,
     ) -> Result<Self::Transaction<'a>, Error> {
-        let tx = self.tx.as_mut().unwrap().transaction(options).await?;
-        Ok(SQLiteTransaction { _conn: self, tx })
+        let tx = Some(self.tx.as_mut().unwrap().transaction(options).await?);
+        Ok(SQLiteTransaction {
+            tx,
+            _phantom: PhantomData,
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl AnyConnectionBackend for SQLiteConnection {
-    async fn transaction<'a>(
-        &'a mut self,
+    async fn transaction<'b>(
+        &'b mut self,
         options: TransactionOptions,
-    ) -> Result<AnyTransaction<'a>, Error> {
+    ) -> Result<AnyTransaction<'b>, Error>
+    where
+        Self: 'b,
+    {
         let tx = Connection::transaction(self, options).await?;
-        Ok(AnyTransaction::new(tx))
+        todo!()
+        // Ok(AnyTransaction::new(tx))
     }
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
@@ -421,49 +438,52 @@ impl AnyConnectionBackend for SQLiteConnection {
 }
 
 pub struct SQLiteTransaction<'a> {
-    _conn: &'a mut SQLiteConnection,
-    tx: TransactionHandle,
+    tx: Option<TransactionHandle>,
+    _phantom: PhantomData<&'a ()>,
+}
+
+impl<'a> Drop for SQLiteTransaction<'a> {
+    fn drop(&mut self) {}
 }
 
 #[async_trait::async_trait]
-impl Executor<'_> for SQLiteTransaction<'_> {
-    type Rows<'b> = SQLiteRows
+impl<'a> Executor<'a> for SQLiteTransaction<'a> {
+    type Rows<'b> = SQLiteRows<'b>
     where
         Self: 'b;
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
-        self.tx.execute(statement).await
+        self.tx.as_mut().unwrap().execute(statement).await
     }
 
-    async fn query<'r>(&'r mut self, statement: &str) -> Result<Self::Rows<'r>, Error> {
-        self.tx.query(statement).await
+    async fn query<'b>(&'b mut self, statement: &str) -> Result<Self::Rows<'b>, Error> {
+        self.tx.as_mut().unwrap().query(statement).await
     }
 }
 
 #[async_trait::async_trait]
-impl Transaction<'_> for SQLiteTransaction<'_> {
+impl<'a> Transaction<'a> for SQLiteTransaction<'a> {
     async fn commit(mut self) -> Result<(), Error> {
-        self.tx.commit().await
+        self.tx.take().unwrap().commit().await
     }
 
     async fn rollback(mut self) -> Result<(), Error> {
-        self.tx.rollback().await
+        self.tx.take().unwrap().rollback().await
     }
 }
 
 #[async_trait::async_trait]
 impl<'a> AnyTransactionBackend<'a> for SQLiteTransaction<'a> {
-    async fn commit(mut self: Box<Self>) -> Result<(), Error> {
-        self.tx.commit().await
+    async fn commit(self: Box<Self>) -> Result<(), Error> {
+        Transaction::commit(*self).await
     }
 
-    async fn rollback(mut self: Box<Self>) -> Result<(), Error> {
-        self.tx.rollback().await
+    async fn rollback(self: Box<Self>) -> Result<(), Error> {
+        Transaction::rollback(*self).await
     }
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
-        Executor::execute(self, statement).await?;
-        Ok(())
+        Executor::execute(self, statement).await
     }
 
     async fn query<'b>(&'b mut self, statement: &str) -> Result<AnyRows<'b>, Error> {
@@ -472,13 +492,18 @@ impl<'a> AnyTransactionBackend<'a> for SQLiteTransaction<'a> {
     }
 }
 
-pub struct SQLiteRows {
+pub struct SQLiteRows<'a> {
     rx: mpsc::Receiver<Result<SQLiteRow, Error>>,
     names: Vec<String>,
+    _phantom: PhantomData<&'a ()>,
+}
+
+impl<'a> Drop for SQLiteRows<'a> {
+    fn drop(&mut self) {}
 }
 
 #[async_trait::async_trait]
-impl Rows<'_> for SQLiteRows {
+impl<'a> Rows<'a> for SQLiteRows<'a> {
     type Row = SQLiteRow;
 
     fn columns(&self) -> &[String] {

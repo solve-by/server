@@ -21,7 +21,7 @@ pub trait AnyConnectionBackend: Send + Sync {
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error>;
 
-    async fn query<'r>(&'r mut self, statement: &str) -> Result<AnyRows<'r>, Error>;
+    async fn query<'a>(&'a mut self, statement: &str) -> Result<AnyRows<'a>, Error>;
 }
 
 #[async_trait::async_trait]
@@ -32,8 +32,32 @@ pub trait AnyTransactionBackend<'a>: Send + Sync {
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error>;
 
-    async fn query<'r>(&'r mut self, statement: &str) -> Result<AnyRows<'r>, Error>;
+    async fn query<'b>(&'b mut self, statement: &str) -> Result<AnyRows<'b>, Error>;
 }
+
+// #[async_trait::async_trait]
+// impl<'a, T, R> AnyTransactionBackend<'a> for T
+// where
+//     for<'b> T: Transaction<'a, Rows<'b> = R> + Send + Sync + 'b,
+//     for<'b> R: Rows<'b> + AnyRowsBackend<'b> + 'b,
+// {
+//     async fn commit(self: Box<Self>) -> Result<(), Error> {
+//         Transaction::commit(*self).await
+//     }
+
+//     async fn rollback(self: Box<Self>) -> Result<(), Error> {
+//         Transaction::rollback(*self).await
+//     }
+
+//     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
+//         Executor::execute(self, statement).await
+//     }
+
+//     async fn query<'b>(&'b mut self, statement: &str) -> Result<AnyRows<'b>, Error> {
+//         let rows = Executor::query(self, statement).await?;
+//         Ok(AnyRows::new(rows))
+//     }
+// }
 
 #[async_trait::async_trait]
 pub trait AnyRowsBackend<'a>: Send + Sync {
@@ -95,7 +119,7 @@ impl AnyConnection {
 }
 
 #[async_trait::async_trait]
-impl Executor<'_> for AnyConnection {
+impl<'a> Executor<'a> for AnyConnection {
     type Rows<'b> = AnyRows<'b>
     where
         Self: 'b;
@@ -104,7 +128,7 @@ impl Executor<'_> for AnyConnection {
         self.inner.execute(statement).await
     }
 
-    async fn query<'r>(&'r mut self, statement: &str) -> Result<Self::Rows<'r>, Error> {
+    async fn query<'b>(&'b mut self, statement: &str) -> Result<Self::Rows<'b>, Error> {
         self.inner.query(statement).await
     }
 }
@@ -133,7 +157,7 @@ impl<'a> AnyTransaction<'a> {
 }
 
 #[async_trait::async_trait]
-impl Transaction<'_> for AnyTransaction<'_> {
+impl<'a> Transaction<'a> for AnyTransaction<'a> {
     async fn commit(self) -> Result<(), Error> {
         self.inner.commit().await
     }
@@ -144,7 +168,7 @@ impl Transaction<'_> for AnyTransaction<'_> {
 }
 
 #[async_trait::async_trait]
-impl Executor<'_> for AnyTransaction<'_> {
+impl<'a> Executor<'a> for AnyTransaction<'a> {
     type Rows<'b> = AnyRows<'b>
     where
         Self: 'b;
@@ -153,7 +177,7 @@ impl Executor<'_> for AnyTransaction<'_> {
         self.inner.execute(statement).await
     }
 
-    async fn query<'r>(&'r mut self, statement: &str) -> Result<Self::Rows<'r>, Error> {
+    async fn query<'b>(&'b mut self, statement: &str) -> Result<Self::Rows<'b>, Error> {
         self.inner.query(statement).await
     }
 }
@@ -170,7 +194,7 @@ impl<'a> AnyRows<'a> {
 }
 
 #[async_trait::async_trait]
-impl Rows<'_> for AnyRows<'_> {
+impl<'a> Rows<'a> for AnyRows<'a> {
     type Row = AnyRow;
 
     fn columns(&self) -> &[String] {

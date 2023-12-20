@@ -54,7 +54,7 @@ pub trait Executor<'a> {
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error>;
 
-    async fn query<'r>(&'r mut self, statement: &str) -> Result<Self::Rows<'r>, Error>;
+    async fn query<'b>(&'b mut self, statement: &str) -> Result<Self::Rows<'b>, Error>;
 }
 
 #[async_trait::async_trait]
