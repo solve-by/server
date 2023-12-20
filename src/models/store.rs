@@ -35,18 +35,22 @@ impl<O: Object> PersistentStore<O> {
         }
     }
 
+    #[allow(unused)]
     async fn create_object(&self, tx: &mut impl Executor<'_>, object: O) -> Result<O, Error> {
         todo!()
     }
 
+    #[allow(unused)]
     async fn update_object(&self, tx: &mut impl Executor<'_>, object: O) -> Result<O, Error> {
         todo!()
     }
 
+    #[allow(unused)]
     async fn delete_object(&self, tx: &mut impl Executor<'_>, object: O::Id) -> Result<(), Error> {
         todo!()
     }
 
+    #[allow(unused)]
     async fn create_event(
         &self,
         tx: &mut impl Executor<'_>,

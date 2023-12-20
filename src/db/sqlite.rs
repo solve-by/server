@@ -23,6 +23,7 @@ struct QueryCommand {
 
 enum ConnectionCommand {
     Transaction {
+        #[allow(unused)]
         options: TransactionOptions,
         tx: oneshot::Sender<Result<TransactionHandle, Error>>,
     },
@@ -56,7 +57,7 @@ impl ConnectionHandle {
         rx.await?
     }
 
-    async fn query<'b>(&'b mut self, statement: &str) -> Result<SQLiteRows, Error> {
+    async fn query(&mut self, statement: &str) -> Result<SQLiteRows<'_>, Error> {
         let (tx, rx) = oneshot::channel();
         self.0
             .send(ConnectionCommand::Query(QueryCommand {
@@ -100,7 +101,7 @@ impl ConnectionTask {
         }
         while let Some(cmd) = self.rx.blocking_recv() {
             match cmd {
-                ConnectionCommand::Transaction { tx, options } => {
+                ConnectionCommand::Transaction { tx, .. } => {
                     let task = TransactionTask::new(&mut conn);
                     task.run(tx)?;
                     continue;
@@ -337,6 +338,7 @@ impl<'a, 'b> TransactionTask<'a, 'b> {
     }
 }
 
+#[derive(Clone)]
 pub struct SQLiteDatabase(deadpool_sqlite::Pool);
 
 #[async_trait::async_trait]
@@ -363,7 +365,7 @@ impl AnyDatabaseBackend for SQLiteDatabase {
     }
 
     fn clone(&self) -> AnyDatabase {
-        AnyDatabase::new(Self(self.0.clone()))
+        AnyDatabase::new(Clone::clone(self))
     }
 }
 
@@ -391,7 +393,7 @@ impl<'a> Executor<'a> for SQLiteConnection {
         self.tx.as_mut().unwrap().execute(statement).await
     }
 
-    async fn query<'b>(&'b mut self, statement: &str) -> Result<Self::Rows<'b>, Error> {
+    async fn query(&mut self, statement: &str) -> Result<Self::Rows<'_>, Error> {
         self.tx.as_mut().unwrap().query(statement).await
     }
 }
@@ -400,10 +402,10 @@ impl<'a> Executor<'a> for SQLiteConnection {
 impl Connection for SQLiteConnection {
     type Transaction<'a> = SQLiteTransaction<'a>;
 
-    async fn transaction<'a>(
-        &'a mut self,
+    async fn transaction(
+        &mut self,
         options: TransactionOptions,
-    ) -> Result<Self::Transaction<'a>, Error> {
+    ) -> Result<Self::Transaction<'_>, Error> {
         let tx = Some(self.tx.as_mut().unwrap().transaction(options).await?);
         Ok(SQLiteTransaction {
             tx,
@@ -414,16 +416,12 @@ impl Connection for SQLiteConnection {
 
 #[async_trait::async_trait]
 impl AnyConnectionBackend for SQLiteConnection {
-    async fn transaction<'b>(
-        &'b mut self,
+    async fn transaction(
+        &mut self,
         options: TransactionOptions,
-    ) -> Result<AnyTransaction<'b>, Error>
-    where
-        Self: 'b,
-    {
+    ) -> Result<AnyTransaction<'_>, Error> {
         let tx = Connection::transaction(self, options).await?;
-        todo!()
-        // Ok(AnyTransaction::new(tx))
+        Ok(AnyTransaction::new(tx))
     }
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
@@ -431,7 +429,7 @@ impl AnyConnectionBackend for SQLiteConnection {
         Ok(())
     }
 
-    async fn query<'b>(&'b mut self, statement: &str) -> Result<AnyRows<'b>, Error> {
+    async fn query(&mut self, statement: &str) -> Result<AnyRows<'_>, Error> {
         let rows = Executor::query(self, statement).await?;
         Ok(AnyRows::new(rows))
     }
@@ -456,7 +454,7 @@ impl<'a> Executor<'a> for SQLiteTransaction<'a> {
         self.tx.as_mut().unwrap().execute(statement).await
     }
 
-    async fn query<'b>(&'b mut self, statement: &str) -> Result<Self::Rows<'b>, Error> {
+    async fn query(&mut self, statement: &str) -> Result<Self::Rows<'_>, Error> {
         self.tx.as_mut().unwrap().query(statement).await
     }
 }
@@ -486,7 +484,7 @@ impl<'a> AnyTransactionBackend<'a> for SQLiteTransaction<'a> {
         Executor::execute(self, statement).await
     }
 
-    async fn query<'b>(&'b mut self, statement: &str) -> Result<AnyRows<'b>, Error> {
+    async fn query(&mut self, statement: &str) -> Result<AnyRows<'_>, Error> {
         let rows = Executor::query(self, statement).await?;
         Ok(AnyRows::new(rows))
     }
@@ -533,8 +531,8 @@ impl Into<AnyRow> for SQLiteRow {
     fn into(self) -> AnyRow {
         let map_value = |v| match v {
             SQLiteValue::Null => Value::Null,
-            SQLiteValue::Integer(v) => Value::I64(v),
-            SQLiteValue::Real(v) => Value::F64(v),
+            SQLiteValue::Integer(v) => Value::Int64(v),
+            SQLiteValue::Real(v) => Value::Float64(v),
             SQLiteValue::Text(v) => Value::String(v),
             SQLiteValue::Blob(v) => Value::Bytes(v),
         };

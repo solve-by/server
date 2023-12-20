@@ -12,17 +12,60 @@ pub trait AnyDatabaseBackend: Send + Sync {
     fn clone(&self) -> AnyDatabase;
 }
 
+// #[async_trait::async_trait]
+// impl<D, C, T, R> AnyDatabaseBackend for D
+// where
+//     for<'a> D: Database<Connection = C> + Send + Sync + Clone + 'a,
+//     for<'a, 'b> C: Connection<Transaction<'a> = T, Rows<'b> = R> + Send + Sync + 'a,
+//     for<'a, 'b> T: AnyTransactionBackend<'a> + 'a,
+//     for<'b> R: AnyRowsBackend<'b> + 'b,
+// {
+//     async fn connection(&self, options: ConnectionOptions) -> Result<AnyConnection, Error> {
+//         let conn = Database::connection(self, options).await?;
+//         Ok(AnyConnection::new(conn))
+//     }
+
+//     fn clone(&self) -> AnyDatabase {
+//         AnyDatabase::new(Clone::clone(self))
+//     }
+// }
+
 #[async_trait::async_trait]
 pub trait AnyConnectionBackend: Send + Sync {
-    async fn transaction<'a>(
-        &'a mut self,
+    async fn transaction(
+        &mut self,
         options: TransactionOptions,
-    ) -> Result<AnyTransaction<'a>, Error>;
+    ) -> Result<AnyTransaction<'_>, Error>;
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error>;
 
-    async fn query<'a>(&'a mut self, statement: &str) -> Result<AnyRows<'a>, Error>;
+    async fn query(&mut self, statement: &str) -> Result<AnyRows<'_>, Error>;
 }
+
+// #[async_trait::async_trait]
+// impl<C, T, R> AnyConnectionBackend for C
+// where
+//     for<'a, 'b> C: Connection<Transaction<'a> = T, Rows<'b> = R> + Send + Sync + 'a,
+//     for<'a, 'b> T: AnyTransactionBackend<'a> + 'a,
+//     for<'b> R: AnyRowsBackend<'b> + 'b,
+// {
+//     async fn transaction(
+//         &mut self,
+//         options: TransactionOptions,
+//     ) -> Result<AnyTransaction<'_>, Error> {
+//         let tx = Connection::transaction(self, options).await?;
+//         Ok(AnyTransaction::new(tx))
+//     }
+
+//     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
+//         Executor::execute(self, statement).await
+//     }
+
+//     async fn query(&mut self, statement: &str) -> Result<AnyRows<'_>, Error> {
+//         let rows = Executor::query(self, statement).await?;
+//         Ok(AnyRows::new(rows))
+//     }
+// }
 
 #[async_trait::async_trait]
 pub trait AnyTransactionBackend<'a>: Send + Sync {
@@ -32,7 +75,7 @@ pub trait AnyTransactionBackend<'a>: Send + Sync {
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error>;
 
-    async fn query<'b>(&'b mut self, statement: &str) -> Result<AnyRows<'b>, Error>;
+    async fn query(&mut self, statement: &str) -> Result<AnyRows<'_>, Error>;
 }
 
 // #[async_trait::async_trait]
@@ -53,7 +96,7 @@ pub trait AnyTransactionBackend<'a>: Send + Sync {
 //         Executor::execute(self, statement).await
 //     }
 
-//     async fn query<'b>(&'b mut self, statement: &str) -> Result<AnyRows<'b>, Error> {
+//     async fn query(&mut self, statement: &str) -> Result<AnyRows<'_>, Error> {
 //         let rows = Executor::query(self, statement).await?;
 //         Ok(AnyRows::new(rows))
 //     }
@@ -206,11 +249,12 @@ impl<'a> Rows<'a> for AnyRows<'a> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Null,
     Bool,
-    I64(i64),
-    F64(f64),
+    Int64(i64),
+    Float64(f64),
     String(String),
     Bytes(Vec<u8>),
 }

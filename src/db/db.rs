@@ -28,15 +28,15 @@ pub struct TransactionOptions {
 }
 
 #[async_trait::async_trait]
-pub trait Connection: Executor<'static> {
-    type Transaction<'a>: Transaction<'a>
+pub trait Connection: for<'a> Executor<'a> {
+    type Transaction<'a>: Transaction<'a> + 'a
     where
         Self: 'a;
 
-    async fn transaction<'a>(
-        &'a mut self,
+    async fn transaction(
+        &mut self,
         options: TransactionOptions,
-    ) -> Result<Self::Transaction<'a>, Error>;
+    ) -> Result<Self::Transaction<'_>, Error>;
 }
 
 #[async_trait::async_trait]
@@ -48,13 +48,13 @@ pub trait Transaction<'a>: Executor<'a> {
 
 #[async_trait::async_trait]
 pub trait Executor<'a> {
-    type Rows<'b>: Rows<'b>
+    type Rows<'b>: Rows<'b> + 'b
     where
         Self: 'b;
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error>;
 
-    async fn query<'b>(&'b mut self, statement: &str) -> Result<Self::Rows<'b>, Error>;
+    async fn query(&mut self, statement: &str) -> Result<Self::Rows<'_>, Error>;
 }
 
 #[async_trait::async_trait]

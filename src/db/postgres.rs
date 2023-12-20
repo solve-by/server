@@ -12,6 +12,7 @@ use super::{
     Executor, IsolationLevel, Rows, Transaction, TransactionOptions,
 };
 
+#[derive(Clone)]
 pub struct PostgresDatabase {
     read_only: deadpool_postgres::Pool,
     writable: deadpool_postgres::Pool,
@@ -33,7 +34,7 @@ impl Database for PostgresDatabase {
         } else {
             self.writable.get().await
         }?;
-        Ok(PostgresConnection(conn))
+        Ok(PostgresConnection { conn })
     }
 }
 
@@ -45,14 +46,13 @@ impl AnyDatabaseBackend for PostgresDatabase {
     }
 
     fn clone(&self) -> AnyDatabase {
-        AnyDatabase::new(Self {
-            read_only: self.read_only.clone(),
-            writable: self.writable.clone(),
-        })
+        AnyDatabase::new(Clone::clone(self))
     }
 }
 
-pub struct PostgresConnection(deadpool_postgres::Client);
+pub struct PostgresConnection {
+    conn: deadpool_postgres::Client,
+}
 
 #[async_trait::async_trait]
 impl<'a> Executor<'a> for PostgresConnection {
@@ -61,14 +61,17 @@ impl<'a> Executor<'a> for PostgresConnection {
         Self: 'b;
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
-        self.0
+        self.conn
             .execute_raw(statement.into(), Vec::<i8>::new())
             .await?;
         Ok(())
     }
 
-    async fn query<'b>(&'b mut self, statement: &str) -> Result<Self::Rows<'b>, Error> {
-        let rows = self.0.query_raw(statement.into(), Vec::<i8>::new()).await?;
+    async fn query(&mut self, statement: &str) -> Result<Self::Rows<'_>, Error> {
+        let rows = self
+            .conn
+            .query_raw(statement.into(), Vec::<i8>::new())
+            .await?;
         Ok(PostgresRows {
             rows: Box::pin(rows),
             _phantom: PhantomData,
@@ -94,7 +97,7 @@ impl Connection for PostgresConnection {
             IsolationLevel::Serializable => tokio_postgres::IsolationLevel::Serializable,
         };
         let tx_builder = self
-            .0
+            .conn
             .build_transaction()
             .read_only(options.read_only)
             .isolation_level(map_level(options.isolation_level));
@@ -105,13 +108,12 @@ impl Connection for PostgresConnection {
 
 #[async_trait::async_trait]
 impl AnyConnectionBackend for PostgresConnection {
-    async fn transaction<'b>(
-        &'b mut self,
+    async fn transaction(
+        &mut self,
         options: TransactionOptions,
-    ) -> Result<AnyTransaction<'b>, Error> {
-        let tx = Connection::transaction::<'b, 'async_trait>(self, options).await?;
-        todo!()
-        // Ok(AnyTransaction::<'b>::new(tx))
+    ) -> Result<AnyTransaction<'_>, Error> {
+        let tx = Connection::transaction(self, options).await?;
+        Ok(AnyTransaction::new(tx))
     }
 
     async fn execute(&mut self, statement: &str) -> Result<(), Error> {
@@ -119,7 +121,7 @@ impl AnyConnectionBackend for PostgresConnection {
         Ok(())
     }
 
-    async fn query<'a>(&'a mut self, statement: &str) -> Result<AnyRows<'a>, Error> {
+    async fn query(&mut self, statement: &str) -> Result<AnyRows<'_>, Error> {
         let rows = Executor::query(self, statement).await?;
         Ok(AnyRows::new(rows))
     }
@@ -148,7 +150,7 @@ impl<'a> Executor<'a> for PostgresTransaction<'a> {
         Ok(())
     }
 
-    async fn query<'b>(&'b mut self, statement: &str) -> Result<Self::Rows<'b>, Error> {
+    async fn query(&mut self, statement: &str) -> Result<Self::Rows<'_>, Error> {
         let rows = self
             .tx
             .as_mut()
@@ -187,7 +189,7 @@ impl<'a> AnyTransactionBackend<'a> for PostgresTransaction<'a> {
         Executor::execute(self, statement).await
     }
 
-    async fn query<'b>(&'b mut self, statement: &str) -> Result<AnyRows<'b>, Error> {
+    async fn query(&mut self, statement: &str) -> Result<AnyRows<'_>, Error> {
         let rows = Executor::query(self, statement).await?;
         Ok(AnyRows::new(rows))
     }
