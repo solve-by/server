@@ -1,82 +1,124 @@
-use std::marker::PhantomData;
-use std::pin::Pin;
 use std::str::FromStr;
+use std::{marker::PhantomData, pin::Pin};
 
+use deadpool_postgres::tokio_postgres::types::{to_sql_checked, FromSql, IsNull, ToSql, Type};
 use futures::StreamExt;
 
 use crate::config::PostgresConfig;
 
-use super::{
-    AnyConnection, AnyConnectionBackend, AnyDatabase, AnyDatabaseBackend, AnyRow, AnyRows,
-    AnyTransaction, AnyTransactionBackend, Connection, ConnectionOptions, Database, Error,
-    Executor, IsolationLevel, Row, Rows, Transaction, TransactionOptions, Value,
-};
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-pub enum PostgresValue {
+#[derive(Debug)]
+pub enum Value {
     Null,
+    Bool(bool),
+    Int16(i16),
+    Int32(i32),
     Int64(i64),
+    Float32(f32),
+    Float64(f64),
+    String(String),
+    Bytes(Vec<u8>),
 }
 
-impl<'a> deadpool_postgres::tokio_postgres::types::FromSql<'a> for PostgresValue {
-    fn from_sql(
-        _ty: &deadpool_postgres::tokio_postgres::types::Type,
-        _raw: &'a [u8],
-    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        todo!()
+impl<'a> FromSql<'a> for Value {
+    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Error> {
+        match *ty {
+            Type::BOOL => Ok(Value::Bool(FromSql::from_sql(ty, raw)?)),
+            Type::INT2 => Ok(Value::Int16(FromSql::from_sql(ty, raw)?)),
+            Type::INT4 => Ok(Value::Int32(FromSql::from_sql(ty, raw)?)),
+            Type::INT8 => Ok(Value::Int64(FromSql::from_sql(ty, raw)?)),
+            Type::FLOAT4 => Ok(Value::Float32(FromSql::from_sql(ty, raw)?)),
+            Type::FLOAT8 => Ok(Value::Float64(FromSql::from_sql(ty, raw)?)),
+            Type::VARCHAR => Ok(Value::String(FromSql::from_sql(ty, raw)?)),
+            Type::BYTEA => Ok(Value::Bytes(FromSql::from_sql(ty, raw)?)),
+            _ => unreachable!(),
+        }
     }
 
-    fn accepts(_ty: &deadpool_postgres::tokio_postgres::types::Type) -> bool {
-        todo!()
+    fn from_sql_null(_ty: &Type) -> Result<Self, Error> {
+        Ok(Value::Null)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        match *ty {
+            Type::BOOL
+            | Type::INT2
+            | Type::INT4
+            | Type::INT8
+            | Type::FLOAT4
+            | Type::FLOAT8
+            | Type::VARCHAR
+            | Type::BYTEA => true,
+            _ => false,
+        }
     }
 }
 
-pub struct PostgresRow {
-    values: Vec<PostgresValue>,
+impl ToSql for Value {
+    fn to_sql(&self, ty: &Type, out: &mut tokio_util::bytes::BytesMut) -> Result<IsNull, Error> {
+        match self {
+            Value::Null => Ok(IsNull::Yes),
+            Value::Bool(v) => ToSql::to_sql(v, ty, out),
+            Value::Int16(v) => ToSql::to_sql(v, ty, out),
+            Value::Int32(v) => ToSql::to_sql(v, ty, out),
+            Value::Int64(v) => ToSql::to_sql(v, ty, out),
+            Value::Float32(v) => ToSql::to_sql(v, ty, out),
+            Value::Float64(v) => ToSql::to_sql(v, ty, out),
+            Value::String(v) => ToSql::to_sql(v, ty, out),
+            Value::Bytes(v) => ToSql::to_sql(v, ty, out),
+        }
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        match *ty {
+            Type::BOOL
+            | Type::INT2
+            | Type::INT4
+            | Type::INT8
+            | Type::FLOAT4
+            | Type::FLOAT8
+            | Type::VARCHAR
+            | Type::BYTEA => true,
+            _ => false,
+        }
+    }
+
+    to_sql_checked!();
 }
 
-impl Row for PostgresRow {
-    type Value = PostgresValue;
+pub struct Row {
+    values: Vec<Value>,
+}
 
-    fn values(&self) -> &[Self::Value] {
+impl Row {
+    pub fn values(&self) -> &[Value] {
         &self.values
     }
-}
 
-impl Into<AnyRow> for PostgresRow {
-    fn into(self) -> AnyRow {
-        let map_value = |v| match v {
-            PostgresValue::Null => Value::Null,
-            PostgresValue::Int64(v) => Value::Int64(v),
-        };
-        AnyRow::new(self.values.into_iter().map(map_value).collect())
+    pub fn into_values(self) -> Vec<Value> {
+        self.values
     }
 }
 
-pub struct PostgresRows<'a> {
+pub struct Rows<'a> {
     columns: Vec<String>,
     rows: Pin<Box<deadpool_postgres::tokio_postgres::RowStream>>,
     _phantom: PhantomData<&'a ()>,
 }
 
-impl<'a> Drop for PostgresRows<'a> {
-    fn drop(&mut self) {}
-}
-
-#[async_trait::async_trait]
-impl<'a> Rows<'a> for PostgresRows<'a> {
-    type Row = PostgresRow;
-
-    fn columns(&self) -> &[String] {
+impl<'a> Rows<'a> {
+    pub fn columns(&self) -> &[String] {
         &self.columns
     }
 
-    async fn next(&mut self) -> Option<Result<Self::Row, Error>> {
+    pub async fn next(&mut self) -> Option<Result<Row, Error>> {
         let map_row = |r: deadpool_postgres::tokio_postgres::Row| {
             let mut values = Vec::with_capacity(self.columns.len());
             for i in 0..self.columns.len() {
                 values.push(r.get(i));
             }
-            PostgresRow { values }
+            Row { values }
         };
         self.rows
             .next()
@@ -85,21 +127,24 @@ impl<'a> Rows<'a> for PostgresRows<'a> {
     }
 }
 
-pub struct PostgresTransaction<'a> {
-    tx: Option<deadpool_postgres::Transaction<'a>>,
-}
-
-impl<'a> Drop for PostgresTransaction<'a> {
+impl<'a> Drop for Rows<'a> {
     fn drop(&mut self) {}
 }
 
-#[async_trait::async_trait]
-impl<'a> Executor<'a> for PostgresTransaction<'a> {
-    type Rows<'b> = PostgresRows<'b>
-    where
-        Self: 'b;
+pub struct Transaction<'a> {
+    tx: Option<deadpool_postgres::Transaction<'a>>,
+}
 
-    async fn execute(&mut self, statement: &str) -> Result<(), Error> {
+impl<'a> Transaction<'a> {
+    pub async fn commit(mut self) -> Result<(), Error> {
+        Ok(self.tx.take().unwrap().commit().await?)
+    }
+
+    pub async fn rollback(mut self) -> Result<(), Error> {
+        Ok(self.tx.take().unwrap().rollback().await?)
+    }
+
+    pub async fn execute(&mut self, statement: &str) -> Result<(), Error> {
         self.tx
             .as_mut()
             .unwrap()
@@ -108,7 +153,7 @@ impl<'a> Executor<'a> for PostgresTransaction<'a> {
         Ok(())
     }
 
-    async fn query(&mut self, statement: &str) -> Result<Self::Rows<'_>, Error> {
+    pub async fn query(&mut self, statement: &str) -> Result<Rows, Error> {
         let tx = self.tx.as_mut().unwrap();
         let statement = deadpool_postgres::tokio_postgres::ToStatement::__convert(statement)
             .into_statement(tx.client())
@@ -124,7 +169,7 @@ impl<'a> Executor<'a> for PostgresTransaction<'a> {
             .unwrap()
             .query_raw(&statement, Vec::<i8>::new())
             .await?;
-        Ok(PostgresRows {
+        Ok(Rows {
             columns,
             rows: Box::pin(rows),
             _phantom: PhantomData,
@@ -132,55 +177,50 @@ impl<'a> Executor<'a> for PostgresTransaction<'a> {
     }
 }
 
-#[async_trait::async_trait]
-impl<'a> Transaction<'a> for PostgresTransaction<'a> {
-    async fn commit(mut self) -> Result<(), Error> {
-        Ok(self.tx.take().unwrap().commit().await?)
-    }
+impl<'a> Drop for Transaction<'a> {
+    fn drop(&mut self) {}
+}
 
-    async fn rollback(mut self) -> Result<(), Error> {
-        Ok(self.tx.take().unwrap().rollback().await?)
+pub type IsolationLevel = deadpool_postgres::tokio_postgres::IsolationLevel;
+
+#[derive(Clone, Copy)]
+pub struct TransactionOptions {
+    pub read_only: bool,
+    pub isolation_level: IsolationLevel,
+}
+
+impl Default for TransactionOptions {
+    fn default() -> Self {
+        Self {
+            read_only: Default::default(),
+            isolation_level: IsolationLevel::ReadCommitted,
+        }
     }
 }
 
-#[async_trait::async_trait]
-impl<'a> AnyTransactionBackend<'a> for PostgresTransaction<'a> {
-    async fn commit(self: Box<Self>) -> Result<(), Error> {
-        Transaction::commit(*self).await
-    }
-
-    async fn rollback(self: Box<Self>) -> Result<(), Error> {
-        Transaction::rollback(*self).await
-    }
-
-    async fn execute(&mut self, statement: &str) -> Result<(), Error> {
-        Executor::execute(self, statement).await
-    }
-
-    async fn query(&mut self, statement: &str) -> Result<AnyRows, Error> {
-        let rows = Executor::query(self, statement).await?;
-        Ok(AnyRows::new(rows))
-    }
-}
-
-pub struct PostgresConnection {
+pub struct Connection {
     conn: deadpool_postgres::Client,
 }
 
-#[async_trait::async_trait]
-impl<'a> Executor<'a> for PostgresConnection {
-    type Rows<'b> = PostgresRows<'b>
-    where
-        Self: 'b;
+impl Connection {
+    pub async fn transaction(&mut self, options: TransactionOptions) -> Result<Transaction, Error> {
+        let tx_builder = self
+            .conn
+            .build_transaction()
+            .read_only(options.read_only)
+            .isolation_level(options.isolation_level);
+        let tx = Some(tx_builder.start().await?);
+        Ok(Transaction { tx })
+    }
 
-    async fn execute(&mut self, statement: &str) -> Result<(), Error> {
+    pub async fn execute(&mut self, statement: &str) -> Result<(), Error> {
         self.conn
             .execute_raw(statement.into(), Vec::<i8>::new())
             .await?;
         Ok(())
     }
 
-    async fn query(&mut self, statement: &str) -> Result<Self::Rows<'_>, Error> {
+    pub async fn query(&mut self, statement: &str) -> Result<Rows, Error> {
         let statement = deadpool_postgres::tokio_postgres::ToStatement::__convert(statement)
             .into_statement(&self.conn)
             .await?;
@@ -190,7 +230,7 @@ impl<'a> Executor<'a> for PostgresConnection {
             .map(|c| c.name().to_owned())
             .collect();
         let rows = self.conn.query_raw(&statement, Vec::<i8>::new()).await?;
-        Ok(PostgresRows {
+        Ok(Rows {
             columns,
             rows: Box::pin(rows),
             _phantom: PhantomData,
@@ -198,144 +238,59 @@ impl<'a> Executor<'a> for PostgresConnection {
     }
 }
 
-pub struct PostgresTransactionOptions {
-    read_only: bool,
-    isolation_level: deadpool_postgres::tokio_postgres::IsolationLevel,
-}
-
-impl From<TransactionOptions> for PostgresTransactionOptions {
-    fn from(options: TransactionOptions) -> Self {
-        use deadpool_postgres::tokio_postgres;
-        let map_level = |v| match v {
-            IsolationLevel::ReadUncommitted => tokio_postgres::IsolationLevel::ReadUncommitted,
-            IsolationLevel::ReadCommitted => tokio_postgres::IsolationLevel::ReadCommitted,
-            IsolationLevel::RepeatableRead => tokio_postgres::IsolationLevel::RepeatableRead,
-            IsolationLevel::Serializable => tokio_postgres::IsolationLevel::Serializable,
-        };
-        Self {
-            read_only: options.read_only,
-            isolation_level: map_level(options.isolation_level),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl Connection for PostgresConnection {
-    type Transaction<'a> = PostgresTransaction<'a>
-    where
-        Self: 'a;
-
-    type TransactionOptions = PostgresTransactionOptions;
-
-    async fn transaction<'a>(
-        &'a mut self,
-        options: Self::TransactionOptions,
-    ) -> Result<Self::Transaction<'a>, Error> {
-        let tx_builder = self
-            .conn
-            .build_transaction()
-            .read_only(options.read_only)
-            .isolation_level(options.isolation_level);
-        let tx = Some(tx_builder.start().await?);
-        Ok(PostgresTransaction { tx })
-    }
-}
-
-#[async_trait::async_trait]
-impl AnyConnectionBackend for PostgresConnection {
-    async fn transaction(
-        &mut self,
-        options: TransactionOptions,
-    ) -> Result<AnyTransaction<'_>, Error> {
-        let tx = Connection::transaction(self, options.into()).await?;
-        Ok(AnyTransaction::new(tx))
-    }
-
-    async fn execute(&mut self, statement: &str) -> Result<(), Error> {
-        Executor::execute(self, statement).await?;
-        Ok(())
-    }
-
-    async fn query(&mut self, statement: &str) -> Result<AnyRows, Error> {
-        let rows = Executor::query(self, statement).await?;
-        Ok(AnyRows::new(rows))
-    }
+#[derive(Clone, Copy, Default)]
+pub struct ConnectionOptions {
+    pub read_only: bool,
 }
 
 #[derive(Clone)]
-pub struct PostgresDatabase {
+pub struct Database {
     read_only: deadpool_postgres::Pool,
     writable: deadpool_postgres::Pool,
 }
 
-impl PostgresDatabase {
-    pub fn new() -> Self {
-        todo!()
+impl Database {
+    pub fn new(config: &PostgresConfig) -> Result<Self, Error> {
+        let mut hosts = Vec::new();
+        let mut ports = Vec::new();
+        for host in &config.hosts {
+            let parts: Vec<_> = host.rsplit(':').take(2).collect();
+            if parts.len() != 2 {
+                return Err(format!("invalid host format {}", host).into());
+            }
+            hosts.push(parts[0].to_owned());
+            ports.push(u16::from_str(parts[1])?);
+        }
+        let mut pg_config = deadpool_postgres::Config {
+            hosts: Some(hosts),
+            ports: Some(ports),
+            user: Some(config.user.to_owned()),
+            password: Some(config.user.to_owned()),
+            dbname: Some(config.name.to_owned()),
+            target_session_attrs: Some(deadpool_postgres::TargetSessionAttrs::Any),
+            ..Default::default()
+        };
+        let tls_config = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let runtime = Some(deadpool_postgres::Runtime::Tokio1);
+        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
+        let read_only = pg_config.create_pool(runtime.clone(), tls.clone())?;
+        pg_config.target_session_attrs = Some(deadpool_postgres::TargetSessionAttrs::ReadWrite);
+        let writable = pg_config.create_pool(runtime.clone(), tls.clone())?;
+        Ok(Self {
+            read_only,
+            writable,
+        })
     }
-}
 
-#[async_trait::async_trait]
-impl Database for PostgresDatabase {
-    type Connection = PostgresConnection;
-
-    type ConnectionOptions = ConnectionOptions;
-
-    async fn connection(
-        &self,
-        options: Self::ConnectionOptions,
-    ) -> Result<Self::Connection, Error> {
+    pub async fn connection(&self, options: ConnectionOptions) -> Result<Connection, Error> {
         let conn = if options.read_only {
             self.read_only.get().await
         } else {
             self.writable.get().await
         }?;
-        Ok(PostgresConnection { conn })
+        Ok(Connection { conn })
     }
-}
-
-#[async_trait::async_trait]
-impl AnyDatabaseBackend for PostgresDatabase {
-    async fn connection(&self, options: ConnectionOptions) -> Result<AnyConnection, Error> {
-        let conn = Database::connection(self, options).await?;
-        Ok(AnyConnection::new(conn))
-    }
-
-    fn clone(&self) -> AnyDatabase {
-        AnyDatabase::new(Clone::clone(self))
-    }
-}
-
-pub async fn new_postgres(config: &PostgresConfig) -> Result<PostgresDatabase, Error> {
-    let mut hosts = Vec::new();
-    let mut ports = Vec::new();
-    for host in &config.hosts {
-        let parts: Vec<_> = host.rsplit(':').take(2).collect();
-        if parts.len() != 2 {
-            return Err(format!("invalid host format {}", host).into());
-        }
-        hosts.push(parts[0].to_owned());
-        ports.push(u16::from_str(parts[1])?);
-    }
-    let mut pg_config = deadpool_postgres::Config {
-        hosts: Some(hosts),
-        ports: Some(ports),
-        user: Some(config.user.to_owned()),
-        password: Some(config.user.to_owned()),
-        dbname: Some(config.name.to_owned()),
-        target_session_attrs: Some(deadpool_postgres::TargetSessionAttrs::Any),
-        ..Default::default()
-    };
-    let tls_config = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(rustls::RootCertStore::empty())
-        .with_no_client_auth();
-    let runtime = Some(deadpool_postgres::Runtime::Tokio1);
-    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
-    let read_only = pg_config.create_pool(runtime.clone(), tls.clone())?;
-    pg_config.target_session_attrs = Some(deadpool_postgres::TargetSessionAttrs::ReadWrite);
-    let writable = pg_config.create_pool(runtime.clone(), tls.clone())?;
-    Ok(PostgresDatabase {
-        read_only,
-        writable,
-    })
 }

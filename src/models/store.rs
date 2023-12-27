@@ -1,13 +1,13 @@
 use std::marker::PhantomData;
 
-use crate::db::{AnyDatabase, AnyTransaction, Connection, Database, Executor};
+use crate::db::any::{Database, Executor, Transaction};
 
 use super::{BaseEvent, Event, Object};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct Context<'a> {
-    pub tx: Option<AnyTransaction<'a>>,
+    pub tx: Option<Transaction<'a>>,
     pub account_id: Option<i64>,
 }
 
@@ -23,12 +23,12 @@ pub trait ObjectStore: Send {
 }
 
 pub struct PersistentStore<O: Object> {
-    db: AnyDatabase,
+    db: Database,
     _phantom: PhantomData<O>,
 }
 
 impl<O: Object> PersistentStore<O> {
-    pub fn new(db: AnyDatabase) -> Self {
+    pub fn new(db: Database) -> Self {
         Self {
             db,
             _phantom: PhantomData,

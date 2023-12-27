@@ -5,126 +5,103 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::SQLiteConfig;
 
-use super::{
-    AnyConnection, AnyConnectionBackend, AnyDatabase, AnyDatabaseBackend, AnyRow, AnyRows,
-    AnyTransaction, AnyTransactionBackend, Connection, ConnectionOptions, Database, Error,
-    Executor, Row, Rows, Transaction, TransactionOptions, Value,
-};
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+pub type Result<T> = std::result::Result<T, Error>;
 
-pub type SQLiteValue = deadpool_sqlite::rusqlite::types::Value;
+pub type Value = deadpool_sqlite::rusqlite::types::Value;
 
-pub struct SQLiteRow {
-    values: Vec<SQLiteValue>,
+pub struct Row {
+    values: Vec<Value>,
 }
 
-impl Row for SQLiteRow {
-    type Value = SQLiteValue;
-
-    fn values(&self) -> &[Self::Value] {
+impl Row {
+    pub fn values(&self) -> &[Value] {
         &self.values
     }
-}
 
-impl Into<AnyRow> for SQLiteRow {
-    fn into(self) -> AnyRow {
-        let map_value = |v| match v {
-            SQLiteValue::Null => Value::Null,
-            SQLiteValue::Integer(v) => Value::Int64(v),
-            SQLiteValue::Real(v) => Value::Float64(v),
-            SQLiteValue::Text(v) => Value::String(v),
-            SQLiteValue::Blob(v) => Value::Bytes(v),
-        };
-        AnyRow::new(self.values.into_iter().map(map_value).collect())
+    pub fn into_values(self) -> Vec<Value> {
+        self.values
     }
 }
 
-pub struct SQLiteRows<'a> {
+pub struct Rows<'a> {
     handle: QueryHandle,
     _phantom: PhantomData<&'a ()>,
 }
 
-impl<'a> Drop for SQLiteRows<'a> {
-    fn drop(&mut self) {}
-}
-
-#[async_trait::async_trait]
-impl<'a> Rows<'a> for SQLiteRows<'a> {
-    type Row = SQLiteRow;
-
-    fn columns(&self) -> &[String] {
+impl<'a> Rows<'a> {
+    pub fn columns(&self) -> &[String] {
         &self.handle.columns
     }
 
-    async fn next(&mut self) -> Option<Result<Self::Row, Error>> {
+    pub async fn next(&mut self) -> Option<Result<Row>> {
         self.handle.rx.recv().await
     }
 }
 
-pub struct SQLiteTransaction<'a> {
+impl<'a> Drop for Rows<'a> {
+    fn drop(&mut self) {}
+}
+
+pub struct Transaction<'a> {
     tx: TransactionHandle,
     _phantom: PhantomData<&'a ()>,
 }
 
-impl<'a> Drop for SQLiteTransaction<'a> {
-    fn drop(&mut self) {}
-}
+impl<'a> Transaction<'a> {
+    pub async fn commit(mut self) -> Result<()> {
+        self.tx.commit().await
+    }
 
-#[async_trait::async_trait]
-impl<'a> Executor<'a> for SQLiteTransaction<'a> {
-    type Rows<'b> = SQLiteRows<'b>
-    where
-        Self: 'b;
+    pub async fn rollback(mut self) -> Result<()> {
+        self.tx.rollback().await
+    }
 
-    async fn execute(&mut self, statement: &str) -> Result<(), Error> {
+    pub async fn execute(&mut self, statement: &str) -> Result<()> {
         self.tx.execute(statement).await
     }
 
-    async fn query(&mut self, statement: &str) -> Result<Self::Rows<'_>, Error> {
+    pub async fn query(&mut self, statement: &str) -> Result<Rows> {
         let handle = self.tx.query(statement).await?;
-        Ok(SQLiteRows {
+        Ok(Rows {
             handle,
             _phantom: PhantomData,
         })
     }
 }
 
-#[async_trait::async_trait]
-impl<'a> Transaction<'a> for SQLiteTransaction<'a> {
-    async fn commit(mut self) -> Result<(), Error> {
-        self.tx.commit().await
-    }
-
-    async fn rollback(mut self) -> Result<(), Error> {
-        self.tx.rollback().await
-    }
+impl<'a> Drop for Transaction<'a> {
+    fn drop(&mut self) {}
 }
 
-#[async_trait::async_trait]
-impl<'a> AnyTransactionBackend<'a> for SQLiteTransaction<'a> {
-    async fn commit(self: Box<Self>) -> Result<(), Error> {
-        Transaction::commit(*self).await
-    }
-
-    async fn rollback(self: Box<Self>) -> Result<(), Error> {
-        Transaction::rollback(*self).await
-    }
-
-    async fn execute(&mut self, statement: &str) -> Result<(), Error> {
-        Executor::execute(self, statement).await
-    }
-
-    async fn query(&mut self, statement: &str) -> Result<AnyRows, Error> {
-        let rows = Executor::query(self, statement).await?;
-        Ok(AnyRows::new(rows))
-    }
-}
-
-pub struct SQLiteConnection {
+pub struct Connection {
     tx: Option<ConnectionHandle>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl Drop for SQLiteConnection {
+impl Connection {
+    pub async fn transaction(&mut self) -> Result<Transaction> {
+        let tx = self.tx.as_mut().unwrap().transaction().await?;
+        Ok(Transaction {
+            tx,
+            _phantom: PhantomData,
+        })
+    }
+
+    pub async fn execute(&mut self, statement: &str) -> Result<()> {
+        self.tx.as_mut().unwrap().execute(statement).await
+    }
+
+    pub async fn query(&mut self, statement: &str) -> Result<Rows> {
+        let handle = self.tx.as_mut().unwrap().query(statement).await?;
+        Ok(Rows {
+            handle,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+impl Drop for Connection {
     fn drop(&mut self) {
         drop(self.tx.take());
         if let Some(handle) = self.handle.take() {
@@ -133,119 +110,41 @@ impl Drop for SQLiteConnection {
     }
 }
 
-#[async_trait::async_trait]
-impl<'a> Executor<'a> for SQLiteConnection {
-    type Rows<'b> = SQLiteRows<'b>
-    where
-        Self: 'b;
-
-    async fn execute(&mut self, statement: &str) -> Result<(), Error> {
-        self.tx.as_mut().unwrap().execute(statement).await
-    }
-
-    async fn query(&mut self, statement: &str) -> Result<Self::Rows<'_>, Error> {
-        let handle = self.tx.as_mut().unwrap().query(statement).await?;
-        Ok(SQLiteRows {
-            handle,
-            _phantom: PhantomData,
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl Connection for SQLiteConnection {
-    type Transaction<'a> = SQLiteTransaction<'a>;
-
-    type TransactionOptions = TransactionOptions;
-
-    async fn transaction(
-        &mut self,
-        options: Self::TransactionOptions,
-    ) -> Result<Self::Transaction<'_>, Error> {
-        let tx = self.tx.as_mut().unwrap().transaction(options).await?;
-        Ok(SQLiteTransaction {
-            tx,
-            _phantom: PhantomData,
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl AnyConnectionBackend for SQLiteConnection {
-    async fn transaction(
-        &mut self,
-        options: TransactionOptions,
-    ) -> Result<AnyTransaction<'_>, Error> {
-        let tx = Connection::transaction(self, options).await?;
-        Ok(AnyTransaction::new(tx))
-    }
-
-    async fn execute(&mut self, statement: &str) -> Result<(), Error> {
-        Executor::execute(self, statement).await?;
-        Ok(())
-    }
-
-    async fn query(&mut self, statement: &str) -> Result<AnyRows, Error> {
-        let rows = Executor::query(self, statement).await?;
-        Ok(AnyRows::new(rows))
-    }
-}
-
 #[derive(Clone)]
-pub struct SQLiteDatabase(deadpool_sqlite::Pool);
+pub struct Database(deadpool_sqlite::Pool);
 
-#[async_trait::async_trait]
-impl Database for SQLiteDatabase {
-    type Connection = SQLiteConnection;
+impl Database {
+    pub fn new(config: &SQLiteConfig) -> Result<Self> {
+        let config = deadpool_sqlite::Config::new(config.path.to_owned());
+        let pool = config.create_pool(deadpool_sqlite::Runtime::Tokio1)?;
+        Ok(Self(pool))
+    }
 
-    type ConnectionOptions = ();
-
-    async fn connection(
-        &self,
-        _options: Self::ConnectionOptions,
-    ) -> Result<Self::Connection, Error> {
+    pub async fn connection(&self) -> Result<Connection> {
         let conn = self.0.get().await?;
         let task = ConnectionTask::new(conn);
         let (tx, rx) = oneshot::channel();
         let handle = tokio::task::spawn_blocking(move || task.run(tx));
-        Ok(SQLiteConnection {
+        Ok(Connection {
             tx: Some(rx.await??),
             handle: Some(handle),
         })
     }
 }
 
-#[async_trait::async_trait]
-impl AnyDatabaseBackend for SQLiteDatabase {
-    async fn connection(&self, _options: ConnectionOptions) -> Result<AnyConnection, Error> {
-        let conn = Database::connection(self, ()).await?;
-        Ok(AnyConnection::new(conn))
-    }
-
-    fn clone(&self) -> AnyDatabase {
-        AnyDatabase::new(Clone::clone(self))
-    }
-}
-
-pub async fn new_sqlite(config: &SQLiteConfig) -> Result<SQLiteDatabase, Error> {
-    let config = deadpool_sqlite::Config::new(config.path.to_owned());
-    let pool = config.create_pool(deadpool_sqlite::Runtime::Tokio1)?;
-    Ok(SQLiteDatabase(pool))
-}
-
 struct ExecuteCommand {
     statement: String,
-    tx: oneshot::Sender<Result<(), Error>>,
+    tx: oneshot::Sender<Result<()>>,
 }
 
 struct QueryCommand {
     statement: String,
-    tx: oneshot::Sender<Result<QueryHandle, Error>>,
+    tx: oneshot::Sender<Result<QueryHandle>>,
 }
 
 struct QueryHandle {
     columns: Vec<String>,
-    rx: mpsc::Receiver<Result<SQLiteRow, Error>>,
+    rx: mpsc::Receiver<Result<Row>>,
 }
 
 struct QueryTask<'a> {
@@ -257,7 +156,7 @@ impl<'a> QueryTask<'a> {
         Self { stmt }
     }
 
-    fn run(mut self, handle_rx: oneshot::Sender<Result<QueryHandle, Error>>) {
+    fn run(mut self, handle_rx: oneshot::Sender<Result<QueryHandle>>) {
         let columns: Vec<_> = self
             .stmt
             .column_names()
@@ -288,7 +187,7 @@ impl<'a> QueryTask<'a> {
             };
             let mut values = Vec::with_capacity(columns_len);
             for i in 0..columns_len {
-                let value: deadpool_sqlite::rusqlite::types::Value = match row.get(i) {
+                let value = match row.get(i) {
                     Ok(value) => value,
                     Err(err) => {
                         _ = tx.blocking_send(Err(err.into()));
@@ -297,7 +196,7 @@ impl<'a> QueryTask<'a> {
                 };
                 values.push(value);
             }
-            if let Err(_) = tx.blocking_send(Ok(SQLiteRow { values })) {
+            if let Err(_) = tx.blocking_send(Ok(Row { values })) {
                 return;
             }
         }
@@ -305,12 +204,8 @@ impl<'a> QueryTask<'a> {
 }
 
 enum TransactionCommand {
-    Commit {
-        tx: oneshot::Sender<Result<(), Error>>,
-    },
-    Rollback {
-        tx: oneshot::Sender<Result<(), Error>>,
-    },
+    Commit { tx: oneshot::Sender<Result<()>> },
+    Rollback { tx: oneshot::Sender<Result<()>> },
     Execute(ExecuteCommand),
     Query(QueryCommand),
 }
@@ -318,19 +213,19 @@ enum TransactionCommand {
 struct TransactionHandle(mpsc::Sender<TransactionCommand>);
 
 impl TransactionHandle {
-    async fn commit(&mut self) -> Result<(), Error> {
+    async fn commit(&mut self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.0.send(TransactionCommand::Commit { tx }).await?;
         rx.await?
     }
 
-    async fn rollback(&mut self) -> Result<(), Error> {
+    async fn rollback(&mut self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.0.send(TransactionCommand::Rollback { tx }).await?;
         rx.await?
     }
 
-    async fn execute(&mut self, statement: &str) -> Result<(), Error> {
+    async fn execute(&mut self, statement: &str) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.0
             .send(TransactionCommand::Execute(ExecuteCommand {
@@ -341,7 +236,7 @@ impl TransactionHandle {
         rx.await?
     }
 
-    async fn query(&mut self, statement: &str) -> Result<QueryHandle, Error> {
+    async fn query(&mut self, statement: &str) -> Result<QueryHandle> {
         let (tx, rx) = oneshot::channel();
         self.0
             .send(TransactionCommand::Query(QueryCommand {
@@ -368,7 +263,7 @@ impl<'a, 'b> TransactionTask<'a, 'b> {
         Self { conn }
     }
 
-    fn run(self, handle_rx: oneshot::Sender<Result<TransactionHandle, Error>>) {
+    fn run(self, handle_rx: oneshot::Sender<Result<TransactionHandle>>) {
         let transaction = match self
             .conn
             .transaction_with_behavior(deadpool_sqlite::rusqlite::TransactionBehavior::Deferred)
@@ -420,9 +315,7 @@ impl<'a, 'b> TransactionTask<'a, 'b> {
 
 enum ConnectionCommand {
     Transaction {
-        #[allow(unused)]
-        options: TransactionOptions,
-        tx: oneshot::Sender<Result<TransactionHandle, Error>>,
+        tx: oneshot::Sender<Result<TransactionHandle>>,
     },
     Execute(ExecuteCommand),
     Query(QueryCommand),
@@ -432,18 +325,13 @@ enum ConnectionCommand {
 struct ConnectionHandle(mpsc::Sender<ConnectionCommand>);
 
 impl ConnectionHandle {
-    async fn transaction(
-        &mut self,
-        options: TransactionOptions,
-    ) -> Result<TransactionHandle, Error> {
+    async fn transaction(&mut self) -> Result<TransactionHandle> {
         let (tx, rx) = oneshot::channel();
-        self.0
-            .send(ConnectionCommand::Transaction { options, tx })
-            .await?;
+        self.0.send(ConnectionCommand::Transaction { tx }).await?;
         rx.await?
     }
 
-    async fn execute(&mut self, statement: &str) -> Result<(), Error> {
+    async fn execute(&mut self, statement: &str) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.0
             .send(ConnectionCommand::Execute(ExecuteCommand {
@@ -454,7 +342,7 @@ impl ConnectionHandle {
         rx.await?
     }
 
-    async fn query(&mut self, statement: &str) -> Result<QueryHandle, Error> {
+    async fn query(&mut self, statement: &str) -> Result<QueryHandle> {
         let (tx, rx) = oneshot::channel();
         self.0
             .send(ConnectionCommand::Query(QueryCommand {
@@ -481,7 +369,7 @@ impl ConnectionTask {
         Self { conn }
     }
 
-    fn run(self, handle_rx: oneshot::Sender<Result<ConnectionHandle, Error>>) {
+    fn run(self, handle_rx: oneshot::Sender<Result<ConnectionHandle>>) {
         let mut conn = match self.conn.lock() {
             Ok(conn) => conn,
             Err(err) => {
