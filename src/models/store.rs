@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Arc};
 
 use crate::db::any::{Database, Executor, Transaction};
 
@@ -23,12 +23,12 @@ pub trait ObjectStore: Send {
 }
 
 pub struct PersistentStore<O: Object> {
-    db: Database,
+    db: Arc<Database>,
     _phantom: PhantomData<O>,
 }
 
 impl<O: Object> PersistentStore<O> {
-    pub fn new(db: Database) -> Self {
+    pub fn new(db: Arc<Database>) -> Self {
         Self {
             db,
             _phantom: PhantomData,

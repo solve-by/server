@@ -158,8 +158,6 @@ pub struct ConnectionOptions {
 #[async_trait::async_trait]
 pub trait DatabaseBackend: Send + Sync {
     async fn connection(&self, options: ConnectionOptions) -> Result<Connection>;
-
-    fn clone_database(&self) -> Database;
 }
 
 struct OwnedTransaction {
@@ -260,12 +258,6 @@ impl Database {
         let mut rows = OwnedRows { conn, rows: None };
         rows.rows = Some(conn.query(statement).await?.inner);
         Ok(Rows::new(rows))
-    }
-}
-
-impl Clone for Database {
-    fn clone(&self) -> Database {
-        self.inner.clone_database()
     }
 }
 

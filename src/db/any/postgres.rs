@@ -83,10 +83,6 @@ impl DatabaseBackend for WrapDatabase {
         let conn = self.0.connection(Default::default()).await?;
         Ok(Connection::new(WrapConnection(conn)))
     }
-
-    fn clone_database(&self) -> Database {
-        Database::new(WrapDatabase(self.0.clone()))
-    }
 }
 
 pub fn new_postgres(config: &PostgresConfig) -> Result<Database> {

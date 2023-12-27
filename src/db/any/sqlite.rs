@@ -79,10 +79,6 @@ impl DatabaseBackend for WrapDatabase {
         let conn = self.0.connection().await?;
         Ok(Connection::new(WrapConnection(conn)))
     }
-
-    fn clone_database(&self) -> Database {
-        Database::new(WrapDatabase(self.0.clone()))
-    }
 }
 
 pub fn new_sqlite(config: &SQLiteConfig) -> Result<Database> {
