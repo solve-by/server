@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
 
+use deadpool_sqlite::rusqlite::params_from_iter;
 use deadpool_sqlite::SyncGuard;
 use tokio::sync::{mpsc, oneshot};
 
@@ -58,12 +59,17 @@ impl<'a> Transaction<'a> {
         self.tx.rollback().await
     }
 
-    pub async fn execute(&mut self, statement: &str) -> Result<()> {
-        self.tx.execute(statement).await
+    pub async fn execute(&mut self, statement: &str, arguments: &[Value]) -> Result<()> {
+        self.tx
+            .execute(statement.to_owned(), arguments.to_owned())
+            .await
     }
 
-    pub async fn query(&mut self, statement: &str) -> Result<Rows> {
-        let handle = self.tx.query(statement).await?;
+    pub async fn query(&mut self, statement: &str, arguments: &[Value]) -> Result<Rows> {
+        let handle = self
+            .tx
+            .query(statement.to_owned(), arguments.to_owned())
+            .await?;
         Ok(Rows {
             handle,
             _phantom: PhantomData,
@@ -89,12 +95,21 @@ impl Connection {
         })
     }
 
-    pub async fn execute(&mut self, statement: &str) -> Result<()> {
-        self.tx.as_mut().unwrap().execute(statement).await
+    pub async fn execute(&mut self, statement: &str, arguments: &[Value]) -> Result<()> {
+        self.tx
+            .as_mut()
+            .unwrap()
+            .execute(statement.to_owned(), arguments.to_owned())
+            .await
     }
 
-    pub async fn query(&mut self, statement: &str) -> Result<Rows> {
-        let handle = self.tx.as_mut().unwrap().query(statement).await?;
+    pub async fn query(&mut self, statement: &str, arguments: &[Value]) -> Result<Rows> {
+        let handle = self
+            .tx
+            .as_mut()
+            .unwrap()
+            .query(statement.to_owned(), arguments.to_owned())
+            .await?;
         Ok(Rows {
             handle,
             _phantom: PhantomData,
@@ -135,11 +150,13 @@ impl Database {
 
 struct ExecuteCommand {
     statement: String,
+    arguments: Vec<Value>,
     tx: oneshot::Sender<Result<()>>,
 }
 
 struct QueryCommand {
     statement: String,
+    arguments: Vec<Value>,
     tx: oneshot::Sender<Result<QueryHandle>>,
 }
 
@@ -150,11 +167,12 @@ struct QueryHandle {
 
 struct QueryTask<'a> {
     stmt: deadpool_sqlite::rusqlite::Statement<'a>,
+    arguments: Vec<Value>,
 }
 
 impl<'a> QueryTask<'a> {
-    fn new(stmt: deadpool_sqlite::rusqlite::Statement<'a>) -> Self {
-        Self { stmt }
+    fn new(stmt: deadpool_sqlite::rusqlite::Statement<'a>, arguments: Vec<Value>) -> Self {
+        Self { stmt, arguments }
     }
 
     fn run(mut self, handle_rx: oneshot::Sender<Result<QueryHandle>>) {
@@ -165,7 +183,10 @@ impl<'a> QueryTask<'a> {
             .map(|v| v.to_owned())
             .collect();
         let columns_len = columns.len();
-        let mut rows = match self.stmt.query([]) {
+        let mut rows = match self
+            .stmt
+            .query(params_from_iter(self.arguments.into_iter()))
+        {
             Ok(rows) => rows,
             Err(err) => {
                 let _ = handle_rx.send(Err(err.into()));
@@ -226,22 +247,24 @@ impl TransactionHandle {
         rx.await?
     }
 
-    async fn execute(&mut self, statement: &str) -> Result<()> {
+    async fn execute(&mut self, statement: String, arguments: Vec<Value>) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.0
             .send(TransactionCommand::Execute(ExecuteCommand {
-                statement: statement.to_owned(),
+                statement,
+                arguments,
                 tx,
             }))
             .await?;
         rx.await?
     }
 
-    async fn query(&mut self, statement: &str) -> Result<QueryHandle> {
+    async fn query(&mut self, statement: String, arguments: Vec<Value>) -> Result<QueryHandle> {
         let (tx, rx) = oneshot::channel();
         self.0
             .send(TransactionCommand::Query(QueryCommand {
-                statement: statement.to_owned(),
+                statement,
+                arguments,
                 tx,
             }))
             .await?;
@@ -293,7 +316,7 @@ impl<'a, 'b> TransactionTask<'a, 'b> {
                 TransactionCommand::Execute(cmd) => {
                     let _ = cmd.tx.send(
                         transaction
-                            .execute(&cmd.statement, [])
+                            .execute(&cmd.statement, params_from_iter(cmd.arguments.into_iter()))
                             .map_err(|e| e.into())
                             .map(|_| ()),
                     );
@@ -306,7 +329,7 @@ impl<'a, 'b> TransactionTask<'a, 'b> {
                             continue;
                         }
                     };
-                    let task = QueryTask::new(stmt);
+                    let task = QueryTask::new(stmt, cmd.arguments);
                     task.run(cmd.tx);
                 }
             }
@@ -332,22 +355,24 @@ impl ConnectionHandle {
         rx.await?
     }
 
-    async fn execute(&mut self, statement: &str) -> Result<()> {
+    async fn execute(&mut self, statement: String, arguments: Vec<Value>) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.0
             .send(ConnectionCommand::Execute(ExecuteCommand {
-                statement: statement.to_owned(),
+                statement,
+                arguments,
                 tx,
             }))
             .await?;
         rx.await?
     }
 
-    async fn query(&mut self, statement: &str) -> Result<QueryHandle> {
+    async fn query(&mut self, statement: String, arguments: Vec<Value>) -> Result<QueryHandle> {
         let (tx, rx) = oneshot::channel();
         self.0
             .send(ConnectionCommand::Query(QueryCommand {
-                statement: statement.to_owned(),
+                statement,
+                arguments,
                 tx,
             }))
             .await?;
@@ -392,7 +417,7 @@ impl ConnectionTask {
                 }
                 ConnectionCommand::Execute(cmd) => {
                     let _ = cmd.tx.send(
-                        conn.execute(&cmd.statement, [])
+                        conn.execute(&cmd.statement, params_from_iter(cmd.arguments.into_iter()))
                             .map_err(|e| e.into())
                             .map(|_| ()),
                     );
@@ -405,7 +430,7 @@ impl ConnectionTask {
                             continue;
                         }
                     };
-                    let task = QueryTask::new(stmt);
+                    let task = QueryTask::new(stmt, cmd.arguments);
                     task.run(cmd.tx);
                 }
                 ConnectionCommand::Shutdown => return,

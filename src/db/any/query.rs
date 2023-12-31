@@ -54,3 +54,9 @@ impl Query for &str {
         (self, &[])
     }
 }
+
+impl Query for (&str, &[Value]) {
+    fn build(&self) -> (&str, &[Value]) {
+        (self.0, self.1)
+    }
+}

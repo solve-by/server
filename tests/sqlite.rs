@@ -20,14 +20,20 @@ async fn test_sqlite() {
     };
     let db = Database::new(&config).unwrap();
     let mut conn = db.connection().await.unwrap();
-    conn.execute(r#"CREATE TABLE test_tbl (a INTEGER PRIMARY KEY, b TEXT NOT NULL)"#)
-        .await
-        .unwrap();
-    conn.execute(r#"INSERT INTO test_tbl (b) VALUES ("test1"), ("test2")"#)
-        .await
-        .unwrap();
+    conn.execute(
+        r#"CREATE TABLE test_tbl (a INTEGER PRIMARY KEY, b TEXT NOT NULL)"#,
+        &[],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        r#"INSERT INTO test_tbl (b) VALUES ($1), ($2)"#,
+        &["test1".to_owned().into(), "test2".to_owned().into()],
+    )
+    .await
+    .unwrap();
     let mut rows = conn
-        .query("SELECT a, b FROM test_tbl ORDER BY a")
+        .query("SELECT a, b FROM test_tbl ORDER BY a", &[])
         .await
         .unwrap();
     assert_eq!(rows.columns(), vec!["a", "b"]);
@@ -43,11 +49,14 @@ async fn test_sqlite() {
     drop(rows);
     // Check commit.
     let mut tx = conn.transaction().await.unwrap();
-    tx.execute(r#"INSERT INTO test_tbl (b) VALUES ("test3")"#)
+    tx.execute(r#"INSERT INTO test_tbl (b) VALUES ("test3")"#, &[])
         .await
         .unwrap();
     tx.commit().await.unwrap();
-    let mut rows = conn.query("SELECT COUNT(*) FROM test_tbl").await.unwrap();
+    let mut rows = conn
+        .query("SELECT COUNT(*) FROM test_tbl", &[])
+        .await
+        .unwrap();
     assert_eq!(
         rows.next().await.unwrap().unwrap().values(),
         vec![Value::Integer(3)]
@@ -55,11 +64,14 @@ async fn test_sqlite() {
     drop(rows);
     // Check rollback.
     let mut tx = conn.transaction().await.unwrap();
-    tx.execute(r#"INSERT INTO test_tbl (b) VALUES ("test3")"#)
+    tx.execute(r#"INSERT INTO test_tbl (b) VALUES ("test3")"#, &[])
         .await
         .unwrap();
     tx.rollback().await.unwrap();
-    let mut rows = conn.query("SELECT COUNT(*) FROM test_tbl").await.unwrap();
+    let mut rows = conn
+        .query("SELECT COUNT(*) FROM test_tbl", &[])
+        .await
+        .unwrap();
     assert_eq!(
         rows.next().await.unwrap().unwrap().values(),
         vec![Value::Integer(3)]
@@ -67,11 +79,14 @@ async fn test_sqlite() {
     drop(rows);
     // Check drop.
     let mut tx = conn.transaction().await.unwrap();
-    tx.execute(r#"INSERT INTO test_tbl (b) VALUES ("test3")"#)
+    tx.execute(r#"INSERT INTO test_tbl (b) VALUES ("test3")"#, &[])
         .await
         .unwrap();
     drop(tx);
-    let mut rows = conn.query("SELECT COUNT(*) FROM test_tbl").await.unwrap();
+    let mut rows = conn
+        .query("SELECT COUNT(*) FROM test_tbl", &[])
+        .await
+        .unwrap();
     assert_eq!(
         rows.next().await.unwrap().unwrap().values(),
         vec![Value::Integer(3)]
@@ -79,10 +94,16 @@ async fn test_sqlite() {
     drop(rows);
     // Check uncommited.
     let mut tx = conn.transaction().await.unwrap();
-    tx.execute(r#"INSERT INTO test_tbl (b) VALUES ("test3")"#)
+    tx.execute(
+        r#"INSERT INTO test_tbl (b) VALUES ($1)"#,
+        &["test3".to_owned().into()],
+    )
+    .await
+    .unwrap();
+    let mut rows = tx
+        .query("SELECT COUNT(*) FROM test_tbl", &[])
         .await
         .unwrap();
-    let mut rows = tx.query("SELECT COUNT(*) FROM test_tbl").await.unwrap();
     assert_eq!(
         rows.next().await.unwrap().unwrap().values(),
         vec![Value::Integer(4)]
@@ -105,9 +126,12 @@ async fn test_any_sqlite() {
     db.execute(r#"CREATE TABLE test_tbl (a INTEGER PRIMARY KEY, b TEXT NOT NULL)"#)
         .await
         .unwrap();
-    db.execute(r#"INSERT INTO test_tbl (b) VALUES ("test1"), ("test2")"#)
-        .await
-        .unwrap();
+    db.execute((
+        r#"INSERT INTO test_tbl (b) VALUES ($1), ($2)"#,
+        ["test1".to_owned().into(), "test2".to_owned().into()].as_slice(),
+    ))
+    .await
+    .unwrap();
     let mut rows = db
         .query("SELECT a, b FROM test_tbl ORDER BY a")
         .await

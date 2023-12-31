@@ -9,6 +9,31 @@ use super::{
     TransactionOptions, Value,
 };
 
+impl From<Value> for sqlite::Value {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Null => sqlite::Value::Null,
+            Value::Bool(v) => sqlite::Value::Integer(v.into()),
+            Value::Int64(v) => sqlite::Value::Integer(v),
+            Value::Float64(v) => sqlite::Value::Real(v),
+            Value::String(v) => sqlite::Value::Text(v),
+            Value::Bytes(v) => sqlite::Value::Blob(v),
+        }
+    }
+}
+
+impl From<sqlite::Value> for Value {
+    fn from(value: sqlite::Value) -> Self {
+        match value {
+            sqlite::Value::Null => Value::Null,
+            sqlite::Value::Integer(v) => Value::Int64(v),
+            sqlite::Value::Real(v) => Value::Float64(v),
+            sqlite::Value::Text(v) => Value::String(v),
+            sqlite::Value::Blob(v) => Value::Bytes(v),
+        }
+    }
+}
+
 struct WrapRows<'a>(sqlite::Rows<'a>, Arc<HashMap<String, usize>>);
 
 #[async_trait::async_trait]
@@ -18,16 +43,9 @@ impl<'a> RowsBackend<'a> for WrapRows<'a> {
     }
 
     async fn next(&mut self) -> Option<Result<Row>> {
-        let map_value = |v| match v {
-            sqlite::Value::Null => Value::Null,
-            sqlite::Value::Integer(v) => Value::Int64(v),
-            sqlite::Value::Real(v) => Value::Float64(v),
-            sqlite::Value::Text(v) => Value::String(v),
-            sqlite::Value::Blob(v) => Value::Bytes(v),
-        };
         Some(self.0.next().await?.map(|r| {
             Row::new(
-                r.into_values().into_iter().map(map_value).collect(),
+                r.into_values().into_iter().map(|v| v.into()).collect(),
                 self.1.clone(),
             )
         }))
@@ -51,11 +69,13 @@ impl<'a> TransactionBackend<'a> for WrapTransaction<'a> {
     }
 
     async fn execute(&mut self, query: &str, values: &[Value]) -> Result<()> {
-        self.0.execute(query).await
+        let values: Vec<_> = values.iter().cloned().map(|v| v.into()).collect();
+        self.0.execute(query, &values).await
     }
 
     async fn query(&mut self, query: &str, values: &[Value]) -> Result<Rows> {
-        let rows = self.0.query(query).await?;
+        let values: Vec<_> = values.iter().cloned().map(|v| v.into()).collect();
+        let rows = self.0.query(query, &values).await?;
         let mut columns = HashMap::with_capacity(rows.columns().len());
         for i in 0..rows.columns().len() {
             columns.insert(rows.columns()[i].clone(), i);
@@ -78,11 +98,13 @@ impl ConnectionBackend for WrapConnection {
     }
 
     async fn execute(&mut self, query: &str, values: &[Value]) -> Result<()> {
-        self.0.execute(&query).await
+        let values: Vec<_> = values.iter().cloned().map(|v| v.into()).collect();
+        self.0.execute(&query, &values).await
     }
 
     async fn query(&mut self, query: &str, values: &[Value]) -> Result<Rows> {
-        let rows = self.0.query(&query).await?;
+        let values: Vec<_> = values.iter().cloned().map(|v| v.into()).collect();
+        let rows = self.0.query(&query, &values).await?;
         let mut columns = HashMap::with_capacity(rows.columns().len());
         for i in 0..rows.columns().len() {
             columns.insert(rows.columns()[i].clone(), i);

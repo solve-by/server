@@ -9,16 +9,9 @@ use super::{
     Result, Row, Rows, RowsBackend, Transaction, TransactionBackend, TransactionOptions, Value,
 };
 
-struct WrapRows<'a>(postgres::Rows<'a>, Arc<HashMap<String, usize>>);
-
-#[async_trait::async_trait]
-impl<'a> RowsBackend<'a> for WrapRows<'a> {
-    fn columns(&self) -> &[String] {
-        self.0.columns()
-    }
-
-    async fn next(&mut self) -> Option<Result<Row>> {
-        let map_value = |v| match v {
+impl From<postgres::Value> for Value {
+    fn from(value: postgres::Value) -> Self {
+        match value {
             postgres::Value::Null => Value::Null,
             postgres::Value::Bool(v) => Value::Bool(v),
             postgres::Value::Int16(v) => Value::Int64(v.into()),
@@ -28,10 +21,22 @@ impl<'a> RowsBackend<'a> for WrapRows<'a> {
             postgres::Value::Float64(v) => Value::Float64(v),
             postgres::Value::String(v) => Value::String(v),
             postgres::Value::Bytes(v) => Value::Bytes(v),
-        };
+        }
+    }
+}
+
+struct WrapRows<'a>(postgres::Rows<'a>, Arc<HashMap<String, usize>>);
+
+#[async_trait::async_trait]
+impl<'a> RowsBackend<'a> for WrapRows<'a> {
+    fn columns(&self) -> &[String] {
+        self.0.columns()
+    }
+
+    async fn next(&mut self) -> Option<Result<Row>> {
         Some(self.0.next().await?.map(|r| {
             Row::new(
-                r.into_values().into_iter().map(map_value).collect(),
+                r.into_values().into_iter().map(|v| v.into()).collect(),
                 self.1.clone(),
             )
         }))
