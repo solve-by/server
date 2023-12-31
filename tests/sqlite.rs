@@ -2,6 +2,7 @@ use std::path::Path;
 
 use solve::db::{
     any,
+    query::Select,
     sqlite::{Database, Value},
 };
 
@@ -100,7 +101,7 @@ async fn test_any_sqlite() {
             .unwrap()
             .to_string(),
     };
-    let db = any::new_sqlite(&config).unwrap();
+    let db: any::Database = Database::new(&config).unwrap().into();
     db.execute(r#"CREATE TABLE test_tbl (a INTEGER PRIMARY KEY, b TEXT NOT NULL)"#)
         .await
         .unwrap();
@@ -112,14 +113,14 @@ async fn test_any_sqlite() {
         .await
         .unwrap();
     assert_eq!(rows.columns(), vec!["a", "b"]);
-    assert_eq!(
-        rows.next().await.unwrap().unwrap().values(),
-        vec![any::Value::Int64(1), any::Value::String("test1".to_owned())]
-    );
-    assert_eq!(
-        rows.next().await.unwrap().unwrap().values(),
-        vec![any::Value::Int64(2), any::Value::String("test2".to_owned())]
-    );
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get(0).unwrap(), any::Value::Int64(1));
+    assert_eq!(row.get(1).unwrap(), any::Value::String("test1".into()));
+    assert_eq!(row.get("a").unwrap(), any::Value::Int64(1));
+    assert_eq!(row.get("b").unwrap(), any::Value::String("test1".into()));
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get(0).unwrap(), any::Value::Int64(2));
+    assert_eq!(row.get(1).unwrap(), any::Value::String("test2".into()));
     assert!(rows.next().await.is_none());
     // Check commit.
     let mut tx = db.transaction(Default::default()).await.unwrap();
@@ -128,10 +129,8 @@ async fn test_any_sqlite() {
         .unwrap();
     tx.commit().await.unwrap();
     let mut rows = db.query("SELECT COUNT(*) FROM test_tbl").await.unwrap();
-    assert_eq!(
-        rows.next().await.unwrap().unwrap().values(),
-        vec![any::Value::Int64(3)]
-    );
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get(0).unwrap(), any::Value::Int64(3));
     // Check rollback.
     let mut tx = db.transaction(Default::default()).await.unwrap();
     tx.execute(r#"INSERT INTO test_tbl (b) VALUES ("test3")"#)
@@ -139,10 +138,8 @@ async fn test_any_sqlite() {
         .unwrap();
     tx.rollback().await.unwrap();
     let mut rows = db.query("SELECT COUNT(*) FROM test_tbl").await.unwrap();
-    assert_eq!(
-        rows.next().await.unwrap().unwrap().values(),
-        vec![any::Value::Int64(3)]
-    );
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get(0).unwrap(), any::Value::Int64(3));
     // Check drop.
     let mut tx = db.transaction(Default::default()).await.unwrap();
     tx.execute(r#"INSERT INTO test_tbl (b) VALUES ("test3")"#)
@@ -150,18 +147,30 @@ async fn test_any_sqlite() {
         .unwrap();
     drop(tx);
     let mut rows = db.query("SELECT COUNT(*) FROM test_tbl").await.unwrap();
-    assert_eq!(
-        rows.next().await.unwrap().unwrap().values(),
-        vec![any::Value::Int64(3)]
-    );
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get(0).unwrap(), any::Value::Int64(3));
     // Check uncommited.
     let mut tx = db.transaction(Default::default()).await.unwrap();
     tx.execute(r#"INSERT INTO test_tbl (b) VALUES ("test3")"#)
         .await
         .unwrap();
     let mut rows = tx.query("SELECT COUNT(*) FROM test_tbl").await.unwrap();
-    assert_eq!(
-        rows.next().await.unwrap().unwrap().values(),
-        vec![any::Value::Int64(4)]
-    );
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get(0).unwrap(), any::Value::Int64(4));
+}
+
+#[tokio::test]
+async fn test_query_builder() {
+    let tmpdir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let _ = tokio::fs::remove_file(tmpdir.join("db3.sqlite")).await;
+    let config = solve::config::SQLiteConfig {
+        path: tmpdir
+            .join("db2.sqlite")
+            .as_os_str()
+            .to_str()
+            .unwrap()
+            .to_string(),
+    };
+    let db: any::Database = Database::new(&config).unwrap().into();
+    let select = Select::new().table("test_tbl");
 }

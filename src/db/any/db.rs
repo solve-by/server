@@ -1,35 +1,72 @@
-use crate::config::DatabaseConfig;
+use std::collections::HashMap;
+use std::sync::Arc;
 
-use super::{new_postgres, new_sqlite};
+use serde::de::value;
+use warp::filters::query;
+
+use crate::config::DatabaseConfig;
+use crate::db::{postgres, sqlite};
+
+use super::{Query, QueryBuilder, Value};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Value {
-    Null,
-    Bool(bool),
-    Int64(i64),
-    Float64(f64),
-    String(String),
-    Bytes(Vec<u8>),
+pub trait ColumnIndex {
+    fn index(&self, row: &Row) -> Result<usize>;
 }
+
+impl ColumnIndex for usize {
+    fn index(&self, row: &Row) -> Result<usize> {
+        if *self < row.values.len() {
+            return Ok(*self);
+        }
+        Err(format!("column out of range: {} >= {}", self, row.values.len()).into())
+    }
+}
+
+impl ColumnIndex for String {
+    fn index(&self, row: &Row) -> Result<usize> {
+        row.columns
+            .get(self)
+            .copied()
+            .ok_or(format!("unknown column name: {}", self).into())
+    }
+}
+
+impl ColumnIndex for &str {
+    fn index(&self, row: &Row) -> Result<usize> {
+        row.columns
+            .get(*self)
+            .copied()
+            .ok_or(format!("unknown column name: {}", *self).into())
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Row {
+    columns: Arc<HashMap<String, usize>>,
     values: Vec<Value>,
 }
 
 impl Row {
-    pub fn new(values: Vec<Value>) -> Self {
-        Self { values }
+    pub fn new(values: Vec<Value>, columns: Arc<HashMap<String, usize>>) -> Self {
+        assert_eq!(values.len(), columns.len());
+        Self { values, columns }
     }
 
-    pub fn values(&self) -> &[Value] {
-        &self.values
+    pub fn get<I: ColumnIndex>(&self, index: I) -> Result<Value> {
+        let index = index.index(self)?;
+        Ok(self.values.get(index).unwrap().clone())
     }
 
-    pub fn into_values(self) -> Vec<Value> {
-        self.values
+    pub fn len(&self) -> usize {
+        self.values.len()
     }
+}
+
+pub trait FromRow: Sized {
+    fn from_row(row: &Row) -> Result<Self>;
 }
 
 #[async_trait::async_trait]
@@ -48,9 +85,7 @@ impl<'a> Rows<'a> {
         let inner = Box::new(rows);
         Self { inner }
     }
-}
 
-impl<'a> Rows<'a> {
     pub fn columns(&self) -> &[String] {
         self.inner.columns()
     }
@@ -62,13 +97,15 @@ impl<'a> Rows<'a> {
 
 #[async_trait::async_trait]
 pub trait TransactionBackend<'a>: Send + Sync {
+    fn builder(&self) -> QueryBuilder;
+
     async fn commit(self: Box<Self>) -> Result<()>;
 
     async fn rollback(self: Box<Self>) -> Result<()>;
 
-    async fn execute(&mut self, statement: &str) -> Result<()>;
+    async fn execute(&mut self, query: &str, values: &[Value]) -> Result<()>;
 
-    async fn query(&mut self, statement: &str) -> Result<Rows>;
+    async fn query(&mut self, query: &str, values: &[Value]) -> Result<Rows>;
 }
 
 pub struct Transaction<'a> {
@@ -81,6 +118,10 @@ impl<'a> Transaction<'a> {
         Self { inner }
     }
 
+    pub fn builder(&self) -> QueryBuilder {
+        self.inner.builder()
+    }
+
     pub async fn commit(self) -> Result<()> {
         self.inner.commit().await
     }
@@ -89,12 +130,14 @@ impl<'a> Transaction<'a> {
         self.inner.rollback().await
     }
 
-    pub async fn execute(&mut self, statement: &str) -> Result<()> {
-        self.inner.execute(statement).await
+    pub async fn execute<Q: Query>(&mut self, query: Q) -> Result<()> {
+        let (query, values) = query.build();
+        self.inner.execute(query, values).await
     }
 
-    pub async fn query(&mut self, statement: &str) -> Result<Rows> {
-        self.inner.query(statement).await
+    pub async fn query<Q: Query>(&mut self, query: Q) -> Result<Rows> {
+        let (query, values) = query.build();
+        self.inner.query(query, values).await
     }
 }
 
@@ -115,11 +158,13 @@ pub struct TransactionOptions {
 
 #[async_trait::async_trait]
 pub trait ConnectionBackend: Send + Sync {
+    fn builder(&self) -> QueryBuilder;
+
     async fn transaction(&mut self, options: TransactionOptions) -> Result<Transaction>;
 
-    async fn execute(&mut self, statement: &str) -> Result<()>;
+    async fn execute(&mut self, query: &str, values: &[Value]) -> Result<()>;
 
-    async fn query(&mut self, statement: &str) -> Result<Rows>;
+    async fn query(&mut self, query: &str, values: &[Value]) -> Result<Rows>;
 }
 
 pub struct Connection {
@@ -131,9 +176,11 @@ impl Connection {
         let inner = Box::new(conn);
         Self { inner }
     }
-}
 
-impl Connection {
+    pub fn builder(&self) -> QueryBuilder {
+        self.inner.builder()
+    }
+
     pub async fn transaction<'a>(
         &'a mut self,
         options: TransactionOptions,
@@ -141,12 +188,14 @@ impl Connection {
         self.inner.transaction(options).await
     }
 
-    pub async fn execute(&mut self, statement: &str) -> Result<()> {
-        self.inner.execute(statement).await
+    pub async fn execute<Q: Query>(&mut self, query: Q) -> Result<()> {
+        let (query, values) = query.build();
+        self.inner.execute(query, values).await
     }
 
-    pub async fn query(&mut self, statement: &str) -> Result<Rows> {
-        self.inner.query(statement).await
+    pub async fn query<Q: Query>(&mut self, query: Q) -> Result<Rows> {
+        let (query, values) = query.build();
+        self.inner.query(query, values).await
     }
 }
 
@@ -157,6 +206,8 @@ pub struct ConnectionOptions {
 
 #[async_trait::async_trait]
 pub trait DatabaseBackend: Send + Sync {
+    fn builder(&self) -> QueryBuilder;
+
     async fn connection(&self, options: ConnectionOptions) -> Result<Connection>;
 }
 
@@ -178,6 +229,10 @@ unsafe impl Sync for OwnedTransaction {}
 
 #[async_trait::async_trait]
 impl<'a> TransactionBackend<'a> for OwnedTransaction {
+    fn builder(&self) -> QueryBuilder {
+        self.tx.as_ref().unwrap().builder()
+    }
+
     async fn commit(mut self: Box<Self>) -> Result<()> {
         self.tx.take().unwrap().commit().await
     }
@@ -186,12 +241,12 @@ impl<'a> TransactionBackend<'a> for OwnedTransaction {
         self.tx.take().unwrap().rollback().await
     }
 
-    async fn execute(&mut self, statement: &str) -> Result<()> {
-        self.tx.as_mut().unwrap().execute(statement).await
+    async fn execute(&mut self, query: &str, values: &[Value]) -> Result<()> {
+        self.tx.as_mut().unwrap().execute(query, values).await
     }
 
-    async fn query(&mut self, statement: &str) -> Result<Rows> {
-        self.tx.as_mut().unwrap().query(statement).await
+    async fn query(&mut self, query: &str, values: &[Value]) -> Result<Rows> {
+        self.tx.as_mut().unwrap().query(query, values).await
     }
 }
 
@@ -232,6 +287,10 @@ impl Database {
         Self { inner }
     }
 
+    pub fn builder(&self) -> QueryBuilder {
+        self.inner.builder()
+    }
+
     pub async fn connection(&self, options: ConnectionOptions) -> Result<Connection> {
         self.inner.connection(options).await
     }
@@ -247,64 +306,65 @@ impl Database {
         Ok(Transaction::new(tx))
     }
 
-    pub async fn execute(&self, statement: &str) -> Result<()> {
+    pub async fn execute<Q: Query>(&self, query: Q) -> Result<()> {
         let mut conn = self.connection(Default::default()).await?;
-        conn.execute(statement).await
+        conn.execute(query).await
     }
 
-    pub async fn query(&self, statement: &str) -> Result<Rows> {
+    pub async fn query<Q: Query>(&self, query: Q) -> Result<Rows> {
+        let (query, values) = query.build();
         let conn = self.connection(Default::default()).await?;
         let conn = Box::leak(conn.inner);
         let mut rows = OwnedRows { conn, rows: None };
-        rows.rows = Some(conn.query(statement).await?.inner);
+        rows.rows = Some(conn.query(query, values).await?.inner);
         Ok(Rows::new(rows))
     }
 }
 
 #[async_trait::async_trait]
 pub trait Executor<'a> {
-    async fn execute(&mut self, statement: &str) -> Result<()>;
+    async fn execute<Q: Query>(&mut self, query: Q) -> Result<()>;
 
-    async fn query(&mut self, statement: &str) -> Result<Rows>;
+    async fn query<Q: Query>(&mut self, query: Q) -> Result<Rows>;
 }
 
 #[async_trait::async_trait]
 impl<'a> Executor<'a> for Transaction<'a> {
-    async fn execute(&mut self, statement: &str) -> Result<()> {
-        Transaction::execute(self, statement).await
+    async fn execute<Q: Query>(&mut self, query: Q) -> Result<()> {
+        Transaction::execute(self, query).await
     }
 
-    async fn query(&mut self, statement: &str) -> Result<Rows> {
-        Transaction::query(self, statement).await
+    async fn query<Q: Query>(&mut self, query: Q) -> Result<Rows> {
+        Transaction::query(self, query).await
     }
 }
 
 #[async_trait::async_trait]
 impl<'a> Executor<'a> for Connection {
-    async fn execute(&mut self, statement: &str) -> Result<()> {
-        Connection::execute(self, statement).await
+    async fn execute<Q: Query>(&mut self, query: Q) -> Result<()> {
+        Connection::execute(self, query).await
     }
 
-    async fn query(&mut self, statement: &str) -> Result<Rows> {
-        Connection::query(self, statement).await
+    async fn query<Q: Query>(&mut self, query: Q) -> Result<Rows> {
+        Connection::query(self, query).await
     }
 }
 
 #[async_trait::async_trait]
 impl<'a> Executor<'a> for Database {
-    async fn execute(&mut self, statement: &str) -> Result<()> {
-        Database::execute(self, statement).await
+    async fn execute<Q: Query>(&mut self, query: Q) -> Result<()> {
+        Database::execute(self, query).await
     }
 
-    async fn query(&mut self, statement: &str) -> Result<Rows> {
-        Database::query(self, statement).await
+    async fn query<Q: Query>(&mut self, query: Q) -> Result<Rows> {
+        Database::query(self, query).await
     }
 }
 
 pub fn new_database(config: &DatabaseConfig) -> Result<Database> {
     let db = match config {
-        DatabaseConfig::SQLite(config) => new_sqlite(config)?,
-        DatabaseConfig::Postgres(config) => new_postgres(config)?,
+        DatabaseConfig::SQLite(config) => sqlite::Database::new(config)?.into(),
+        DatabaseConfig::Postgres(config) => postgres::Database::new(config)?.into(),
     };
     Ok(db)
 }

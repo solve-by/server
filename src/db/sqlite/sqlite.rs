@@ -10,6 +10,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub type Value = deadpool_sqlite::rusqlite::types::Value;
 
+#[derive(Clone, Debug)]
 pub struct Row {
     values: Vec<Value>,
 }

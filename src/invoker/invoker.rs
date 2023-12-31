@@ -1,19 +1,24 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::core::Core;
 use crate::models::Error;
 
 struct Task {}
 
-pub struct Invoker {}
+pub struct Invoker {
+    core: Arc<Core>,
+}
 
 impl Invoker {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(core: Arc<Core>) -> Self {
+        Self { core }
     }
 
     pub async fn run(self, shutdown: CancellationToken) -> Result<(), Error> {
+        slog::info!(self.core.logger(), "Running invoker loop");
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
@@ -43,6 +48,7 @@ impl Invoker {
     }
 
     async fn take_task(&self) -> Result<Option<Task>, Error> {
+        let tasks = self.core.tasks().expect("task store should be initialized");
         todo!()
     }
 

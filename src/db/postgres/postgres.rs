@@ -8,8 +8,9 @@ use crate::config::PostgresConfig;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub enum Value {
+    #[default]
     Null,
     Bool(bool),
     Int16(i16),
@@ -87,6 +88,7 @@ impl ToSql for Value {
     to_sql_checked!();
 }
 
+#[derive(Clone, Debug)]
 pub struct Row {
     values: Vec<Value>,
 }

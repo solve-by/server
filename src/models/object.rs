@@ -1,6 +1,8 @@
-use std::time::Instant;
+use crate::db::any::{Error, FromRow, Result, Row, Value};
 
-pub trait Object: Default + Clone + Send + Sync + 'static {
+use super::types::{now, Instant};
+
+pub trait Object: FromRow + Default + Clone + Send + Sync + 'static {
     type Id: Default + Copy + Send + Sync + 'static;
 
     fn get_id(&self) -> Self::Id;
@@ -8,7 +10,7 @@ pub trait Object: Default + Clone + Send + Sync + 'static {
     fn set_id(&mut self, id: Self::Id);
 }
 
-pub trait Event: Default + Clone + Send + Sync + 'static {
+pub trait Event: FromRow + Default + Clone + Send + Sync + 'static {
     type Object: Object;
 
     fn get_id(&self) -> i64;
@@ -36,9 +38,22 @@ pub trait Event: Default + Clone + Send + Sync + 'static {
 
 #[derive(Clone, Copy)]
 pub enum EventKind {
-    Create = 1,
-    Delete = 2,
-    Update = 3,
+    Create,
+    Delete,
+    Update,
+}
+
+impl TryFrom<Value> for EventKind {
+    type Error = Error;
+
+    fn try_from(value: Value) -> Result<Self> {
+        match value.try_into()? {
+            1 => Ok(EventKind::Create),
+            2 => Ok(EventKind::Delete),
+            3 => Ok(EventKind::Update),
+            v => Err(format!("unknown event kind: {}", v).into()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -81,11 +96,23 @@ impl<O: Object> Default for BaseEvent<O> {
     fn default() -> Self {
         Self {
             id: Default::default(),
-            time: Instant::now(),
+            time: now(),
             account_id: Default::default(),
             kind: EventKind::Create,
             object: Default::default(),
         }
+    }
+}
+
+impl<O: Object> FromRow for BaseEvent<O> {
+    fn from_row(row: &Row) -> Result<Self> {
+        Ok(Self {
+            id: row.get("event_id")?.try_into()?,
+            time: row.get("event_time")?.try_into()?,
+            account_id: row.get("event_account_id")?.try_into()?,
+            kind: row.get("event_kind")?.try_into()?,
+            object: FromRow::from_row(row)?,
+        })
     }
 }
 
