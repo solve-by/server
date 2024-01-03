@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use serde::de::value;
-use warp::filters::query;
-
 use crate::config::DatabaseConfig;
 use crate::db::{postgres, sqlite};
 
@@ -323,6 +320,8 @@ impl Database {
 
 #[async_trait::async_trait]
 pub trait Executor<'a> {
+    fn builder(&self) -> QueryBuilder;
+
     async fn execute<Q: Query>(&mut self, query: Q) -> Result<()>;
 
     async fn query<Q: Query>(&mut self, query: Q) -> Result<Rows>;
@@ -330,6 +329,10 @@ pub trait Executor<'a> {
 
 #[async_trait::async_trait]
 impl<'a> Executor<'a> for Transaction<'a> {
+    fn builder(&self) -> QueryBuilder {
+        Transaction::builder(&self)
+    }
+
     async fn execute<Q: Query>(&mut self, query: Q) -> Result<()> {
         Transaction::execute(self, query).await
     }
@@ -341,6 +344,10 @@ impl<'a> Executor<'a> for Transaction<'a> {
 
 #[async_trait::async_trait]
 impl<'a> Executor<'a> for Connection {
+    fn builder(&self) -> QueryBuilder {
+        Connection::builder(&self)
+    }
+
     async fn execute<Q: Query>(&mut self, query: Q) -> Result<()> {
         Connection::execute(self, query).await
     }
@@ -352,6 +359,10 @@ impl<'a> Executor<'a> for Connection {
 
 #[async_trait::async_trait]
 impl<'a> Executor<'a> for Database {
+    fn builder(&self) -> QueryBuilder {
+        Database::builder(&self)
+    }
+
     async fn execute<Q: Query>(&mut self, query: Q) -> Result<()> {
         Database::execute(self, query).await
     }

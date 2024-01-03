@@ -99,12 +99,12 @@ impl ConnectionBackend for WrapConnection {
 
     async fn execute(&mut self, query: &str, values: &[Value]) -> Result<()> {
         let values: Vec<_> = values.iter().cloned().map(|v| v.into()).collect();
-        self.0.execute(&query, &values).await
+        self.0.execute(query, values).await
     }
 
     async fn query(&mut self, query: &str, values: &[Value]) -> Result<Rows> {
         let values: Vec<_> = values.iter().cloned().map(|v| v.into()).collect();
-        let rows = self.0.query(&query, &values).await?;
+        let rows = self.0.query(query, values).await?;
         let mut columns = HashMap::with_capacity(rows.columns().len());
         for i in 0..rows.columns().len() {
             columns.insert(rows.columns()[i].clone(), i);

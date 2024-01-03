@@ -1,4 +1,4 @@
-use std::path::Path;
+mod common;
 
 #[test]
 fn test_parse_str() {
@@ -35,7 +35,7 @@ fn test_parse_str() {
 
 #[test]
 fn test_parse_file() {
-    let tmpdir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let tmpdir = common::temp_dir().unwrap();
     let data = r#"{
         "db": {
             "driver": "sqlite",

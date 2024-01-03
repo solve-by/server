@@ -1,15 +1,14 @@
-use std::path::Path;
-
 use solve::db::{
     any,
     query::Select,
     sqlite::{Database, Value},
 };
 
+mod common;
+
 #[tokio::test]
 async fn test_sqlite() {
-    let tmpdir = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let _ = tokio::fs::remove_file(tmpdir.join("db.sqlite")).await;
+    let tmpdir = common::temp_dir().unwrap();
     let config = solve::config::SQLiteConfig {
         path: tmpdir
             .join("db.sqlite")
@@ -112,11 +111,10 @@ async fn test_sqlite() {
 
 #[tokio::test]
 async fn test_any_sqlite() {
-    let tmpdir = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let _ = tokio::fs::remove_file(tmpdir.join("db2.sqlite")).await;
+    let tmpdir = common::temp_dir().unwrap();
     let config = solve::config::SQLiteConfig {
         path: tmpdir
-            .join("db2.sqlite")
+            .join("db.sqlite")
             .as_os_str()
             .to_str()
             .unwrap()
@@ -185,11 +183,10 @@ async fn test_any_sqlite() {
 
 #[tokio::test]
 async fn test_query_builder() {
-    let tmpdir = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let _ = tokio::fs::remove_file(tmpdir.join("db3.sqlite")).await;
+    let tmpdir = common::temp_dir().unwrap();
     let config = solve::config::SQLiteConfig {
         path: tmpdir
-            .join("db2.sqlite")
+            .join("db.sqlite")
             .as_os_str()
             .to_str()
             .unwrap()

@@ -1,4 +1,4 @@
-use crate::db::any::{Query, QueryBuilder, Value};
+use crate::db::any::QueryBuilder;
 
 pub struct Select {
     table: String,

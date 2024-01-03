@@ -1,6 +1,7 @@
 use std::{marker::PhantomData, sync::Arc};
 
-use crate::db::any::{Database, Executor, Transaction};
+use crate::db::any::{Database, Executor, FromRow, Transaction};
+use crate::db::query::{Insert, Update};
 
 use super::{BaseEvent, Event, Object};
 
@@ -24,25 +25,47 @@ pub trait ObjectStore: Send {
 
 pub struct PersistentStore<O: Object> {
     db: Arc<Database>,
+    table: String,
+    event_table: String,
     _phantom: PhantomData<O>,
 }
 
 impl<O: Object> PersistentStore<O> {
-    pub fn new(db: Arc<Database>) -> Self {
+    pub fn new<T: Into<String>, ET: Into<String>>(
+        db: Arc<Database>,
+        table: T,
+        event_table: ET,
+    ) -> Self {
         Self {
             db,
+            table: table.into(),
+            event_table: event_table.into(),
             _phantom: PhantomData,
         }
     }
 
     #[allow(unused)]
     async fn create_object(&self, tx: &mut impl Executor<'_>, object: O) -> Result<O, Error> {
-        todo!()
+        let query = Insert::new().table(&self.table).query(tx.builder());
+        let mut rows = tx.query(query).await?;
+        let row = match rows.next().await {
+            Some(Ok(v)) => v,
+            Some(Err(v)) => return Err(v),
+            None => return Err("empty query result".into()),
+        };
+        FromRow::from_row(&row)
     }
 
     #[allow(unused)]
     async fn update_object(&self, tx: &mut impl Executor<'_>, object: O) -> Result<O, Error> {
-        todo!()
+        let query = Update::new().table(&self.table).query(tx.builder());
+        let mut rows = tx.query(query).await?;
+        let row = match rows.next().await {
+            Some(Ok(v)) => v,
+            Some(Err(v)) => return Err(v),
+            None => return Err("empty query result".into()),
+        };
+        FromRow::from_row(&row)
     }
 
     #[allow(unused)]
@@ -56,7 +79,14 @@ impl<O: Object> PersistentStore<O> {
         tx: &mut impl Executor<'_>,
         event: BaseEvent<O>,
     ) -> Result<BaseEvent<O>, Error> {
-        todo!()
+        let query = Insert::new().table(&self.event_table).query(tx.builder());
+        let mut rows = tx.query(query).await?;
+        let row = match rows.next().await {
+            Some(Ok(v)) => v,
+            Some(Err(v)) => return Err(v),
+            None => return Err("empty query result".into()),
+        };
+        FromRow::from_row(&row)
     }
 }
 

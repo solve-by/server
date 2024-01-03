@@ -55,14 +55,30 @@ impl Core {
     }
 
     pub async fn init_server(&mut self) -> Result<()> {
-        self.files = Some(Arc::new(FileStore::new(self.db())));
-        self.tasks = Some(Arc::new(TaskStore::new(self.db())));
+        self.files = Some(Arc::new(FileStore::new(
+            self.db(),
+            "solve_file",
+            "solve_file_event",
+        )));
+        self.tasks = Some(Arc::new(TaskStore::new(
+            self.db(),
+            "solve_task",
+            "solve_task_event",
+        )));
         Ok(())
     }
 
     pub async fn init_invoker(&mut self) -> Result<()> {
-        self.files = Some(Arc::new(FileStore::new(self.db())));
-        self.tasks = Some(Arc::new(TaskStore::new(self.db())));
+        self.files = Some(Arc::new(FileStore::new(
+            self.db(),
+            "solve_file",
+            "solve_file_event",
+        )));
+        self.tasks = Some(Arc::new(TaskStore::new(
+            self.db(),
+            "solve_task",
+            "solve_task_event",
+        )));
         Ok(())
     }
 }
